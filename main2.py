@@ -23,6 +23,8 @@ UNK = 0
 device = torch.device('cuda')
 EPSILON = 1e-13
 INF = 1e13
+PAD_FIRST = False
+
 
 # N_EPOCH = 4
 # BATCH_SIZE = 32
@@ -36,6 +38,11 @@ MAX_LEN = 32
 FIX_LEN = False
 DATASET_NAME = 'SciTailV1.1'
 
+# N_EPOCH = 4
+# BATCH_SIZE = 32
+# MAX_LEN = 50
+# FIX_LEN = False
+# DATASET_NAME = 'snli'
 
 def read_train(fname):
     df = pd.read_csv(fname, index_col=None)
@@ -71,11 +78,15 @@ def read_eval(fname, stoi):
 
 class CustomDataset(Dataset):
 
-    def __init__(self, context_idx, response_idx, labels) -> None:
+    def __init__(self, context_idx, response_idx, labels, keep=None) -> None:
         super().__init__()
         self.contexts = context_idx
         self.responses = response_idx
         self.labels = labels
+        if keep is not None:
+            self.contexts = context_idx[:keep]
+            self.responses = response_idx[:keep]
+            self.labels = labels[:keep]
 
     def __getitem__(self, index: int):
         return self.contexts[index], self.responses[index], self.labels[index]
@@ -95,14 +106,21 @@ test_dataset = CustomDataset(*read_eval(DATASET_NAME + '/test.csv', stoi))
 
 # TODO sort batches
 
+def pad(s, l):
+    if PAD_FIRST:
+        return [PAD] * (l-len(s)) + s
+    else:
+        return s + [PAD] * (l-len(s))
+
+
 def collate(batch):
     # m = max([len(i[0]) for i in batch])
     if FIX_LEN:
         m, n = MAX_LEN, MAX_LEN
     else:
         m, n = np.array([[len(i[0]), len(i[1])] for i in batch]).max(0).tolist()
-    contexts = torch.LongTensor([[1] * (m - len(item[0])) + item[0] for item in batch])
-    response = torch.LongTensor([[1] * (n - len(item[1])) + item[1] for item in batch])
+    contexts = torch.LongTensor([pad(item[0], m) for item in batch])
+    response = torch.LongTensor([pad(item[1], n) for item in batch])
     labels = torch.LongTensor([item[2] for item in batch])
     return [contexts, response, labels]
 
@@ -112,6 +130,7 @@ dev_data_loader = DataLoader(dev_dataset, batch_size=BATCH_SIZE, shuffle=True, c
 test_data_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=True, collate_fn=collate)
 
 VOCAB_LEN = len(itos)
+print('Vocab length is {}'.format(VOCAB_LEN))
 
 # %%
 print('Reading Embeddings...')
@@ -726,13 +745,13 @@ def p_r(tp, tn, fp, fn):
 
 
 optimizer = torch.optim.Adam(lr=LR, params=model.parameters())
-criterion = nn.BCELoss(reduction='sum')
+criterion = nn.BCEWithLogitsLoss(reduction='sum')
 
 # train_weights = (1 / train_dataset.labels.value_counts(normalize=True))
 # train_weights = train_weights.to_numpy() / train_weights.sum()
 # train_weights = torch.Tensor(train_weights).to(device)
 
-progress_bar = tqdm(range(20))
+progress_bar = tqdm(range(1, N_EPOCH + 1))
 for i_epoch in progress_bar:
     # for i_epoch in range(20):
     model.train()
@@ -749,7 +768,7 @@ for i_epoch in progress_bar:
         x1, x2, y = x1.to(device), x2.to(device), y.to(device)
         y_hat = model(x1, x2)
 
-        loss = F.binary_cross_entropy_with_logits(y_hat, y.float(), reduction='sum')
+        loss = criterion(y_hat, y.float())
 
         loss.backward()
         optimizer.step()
@@ -766,7 +785,7 @@ for i_epoch in progress_bar:
             x1, x2, y = x1.to(device), x2.to(device), y.to(device)
             y_hat = model(x1, x2)
 
-            loss = F.binary_cross_entropy_with_logits(y_hat, y.float(), reduction='sum')
+            loss = criterion(y_hat, y.float())
 
             test_metrics += [loss.item(), *calc_metrics(y, y_hat), y.shape[0]]
 
