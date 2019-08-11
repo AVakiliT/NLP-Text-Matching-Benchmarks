@@ -7,12 +7,11 @@ import numpy as np
 import pandas as pd
 import torch
 from nltk import word_tokenize
+from sklearn.metrics import confusion_matrix
 from torch.utils.data import Dataset, DataLoader, Sampler
 from torch import nn
 from torch.nn import functional as F
 from tqdm import tqdm
-
-
 
 # %%
 MIN_FREQ = 2
@@ -25,24 +24,26 @@ EPSILON = 1e-13
 INF = 1e13
 PAD_FIRST = False
 
-
 # N_EPOCH = 4
 # BATCH_SIZE = 32
 # MAX_LEN = 25
 # FIX_LEN = True
 # DATASET_NAME = 'quora'
 
-N_EPOCH = 4
-BATCH_SIZE = 32
-MAX_LEN = 32
-FIX_LEN = False
-DATASET_NAME = 'SciTailV1.1'
-
 # N_EPOCH = 4
 # BATCH_SIZE = 32
-# MAX_LEN = 50
+# MAX_LEN = 32
 # FIX_LEN = False
-# DATASET_NAME = 'snli'
+# DATASET_NAME = 'SciTailV1.1'
+# NUM_CLASS=2
+
+N_EPOCH = 4
+BATCH_SIZE = 32
+MAX_LEN = 30
+FIX_LEN = False
+DATASET_NAME = 'snli'
+NUM_CLASS = 3
+
 
 def read_train(fname):
     df = pd.read_csv(fname, index_col=None)
@@ -108,9 +109,9 @@ test_dataset = CustomDataset(*read_eval(DATASET_NAME + '/test.csv', stoi))
 
 def pad(s, l):
     if PAD_FIRST:
-        return [PAD] * (l-len(s)) + s
+        return [PAD] * (l - len(s)) + s
     else:
-        return s + [PAD] * (l-len(s))
+        return s + [PAD] * (l - len(s))
 
 
 def collate(batch):
@@ -244,7 +245,7 @@ class ESIM(nn.Module):
         self.final = nn.Sequential(
             nn.Linear(2 * 2 * 4 * hidden_dim, hidden_dim),
             nn.ReLU(),
-            nn.Linear(hidden_dim, 1),
+            nn.Linear(hidden_dim, NUM_CLASS),
         )
 
     def forward(self, x1, x2):
@@ -728,77 +729,112 @@ model = ESIM().to(device)
 LR = 1e-3
 
 
-def calc_metrics(y, y_hat):
+def calc_metrics(y, y_hat, num_classes=2):
     with torch.no_grad():
-        tp = (y_hat.gt(0) & y.byte()).sum().item()
-        tn = (~y_hat.gt(0) & ~y.byte()).sum().item()
-        fp = (y_hat.gt(0) & ~y.byte()).sum().item()
-        fn = (~y_hat.gt(0) & y.byte()).sum().item()
-    return tp, tn, fp, fn
+        if num_classes == 2:
+            pred = y_hat.gt(0)
+        else:
+            pred = y_hat.argmax(-1)
+
+    m = confusion_matrix(y.cpu(), pred.cpu(), range(num_classes))
+    return m
 
 
-def p_r(tp, tn, fp, fn):
-    p = tp / (tp + fp)
-    f1 = (2 * tp) / (2 * tp + fp + fn)
-    accu = (tp + tn) / (tp + tn + fn + fp)
-    return p, f1, accu
+def p_r_(m):
+    p = (m.diagonal() / max(m.sum(0), EPSILON)).mean()
+    r = (m.diagonal() / max(m.sum(1), EPSILON)).mean()
+    f1 = ((2 * p * r) / (p + r)).mean()
+    accu = m.diagonal().sum() / m.sum()
+    return p, r, f1, accu
 
 
 optimizer = torch.optim.Adam(lr=LR, params=model.parameters())
-criterion = nn.BCEWithLogitsLoss(reduction='sum')
 
 # train_weights = (1 / train_dataset.labels.value_counts(normalize=True))
 # train_weights = train_weights.to_numpy() / train_weights.sum()
 # train_weights = torch.Tensor(train_weights).to(device)
 
-progress_bar = tqdm(range(1, N_EPOCH + 1))
-for i_epoch in progress_bar:
-    # for i_epoch in range(20):
+# progress_bar = tqdm(range(1, N_EPOCH + 1))
+# for i_epoch in progress_bar:
+for i_epoch in range(1, N_EPOCH + 1):
     model.train()
-    # loss_total = 0
+    loss_total = 0
     # accu_total = 0
-    # total = 0
-    train_metrics = np.zeros((1 + 4 + 1))
-    # for x1, x2, y in train_data_loader:
-    # progress_bar2 = tqdm(train_data_loader)
-    for x1, x2, y in train_data_loader:
-        # for x1, x2, y in progress_bar2:
+    total = 0
+    train_metrics = np.zeros((NUM_CLASS, NUM_CLASS))
+
+    progress_bar = tqdm(train_data_loader)
+    for x1, x2, y in progress_bar:
+        # for x1, x2, y in train_data_loader:
         optimizer.zero_grad()
         # weights = train_weights[y]
         x1, x2, y = x1.to(device), x2.to(device), y.to(device)
         y_hat = model(x1, x2)
 
-        loss = criterion(y_hat, y.float())
+        if NUM_CLASS == 2:
+            loss = F.binary_cross_entropy_with_logits(y_hat, y.float(), reduction='sum')
+        else:
+            loss = F.cross_entropy(y_hat, y, reduction='sum')
 
         loss.backward()
         optimizer.step()
 
-        train_metrics += [loss.item(), *calc_metrics(y, y_hat), y.shape[0]]
+        loss_total += loss.item()
+        total += y.shape[0]
+        train_metrics += calc_metrics(y, y_hat, NUM_CLASS)
+
+        metrics = (
+            loss_total / total,
+            *p_r_(train_metrics),
+        )
+
+        progress_bar.set_description('[ EP {0:02d} ]'
+                                     # '[ TRN LS: {1:.3f} PR: {2:.3f} F1: {3:.3f} AC: {4:.3f}]'
+                                     '[ TRN LS: {1:.3f} AC: {5:.3f} ]'
+                                     .format(i_epoch, *metrics))
 
     model.eval()
 
-    test_metrics = np.zeros((1 + 4 + 1))
+    loss_total_test = 0
+    total_test = 0
+    test_metrics = np.zeros((NUM_CLASS, NUM_CLASS))
 
     with torch.no_grad():
-        # progress_bar = tqdm(test_data_loader)
-        for x1, x2, y in dev_data_loader:
+        progress_bar = tqdm(dev_data_loader)
+        for x1, x2, y in progress_bar:
+            # for x1, x2, y in dev_data_loader:
             x1, x2, y = x1.to(device), x2.to(device), y.to(device)
             y_hat = model(x1, x2)
 
-            loss = criterion(y_hat, y.float())
+            if NUM_CLASS == 2:
+                loss = F.binary_cross_entropy_with_logits(y_hat, y.float(), reduction='sum')
+            else:
+                loss = F.cross_entropy(y_hat, y, reduction='sum')
 
-            test_metrics += [loss.item(), *calc_metrics(y, y_hat), y.shape[0]]
+            loss_total_test += loss.item()
+            total_test += y.shape[0]
+            test_metrics += calc_metrics(y, y_hat, NUM_CLASS)
 
-    metrics = (
-        train_metrics[0] / train_metrics[-1],
-        *p_r(*train_metrics[1:-1]),
-        test_metrics[0] / test_metrics[-1],
-        *p_r(*test_metrics[1:-1])
-    )
+            metrics = (
+                loss_total_test / total_test,
+                *p_r_(test_metrics)
+            )
 
-    progress_bar.set_description('[ EP {0:02d} ]'
-                                 # '[ TRN LS: {1:.3f} PR: {2:.3f} F1: {3:.3f} AC: {4:.3f}]'
-                                 '[ TRN LS: {1:.3f} AC: {4:.3f} ]'
-                                 # '[ TST LS: {5:.3f} PR: {6:.3f} F1: {7:.3f} AC: {8:.3f} ]'
-                                 '[ TST LS: {5:.3f} AC: {8:.3f} ]'
-                                 .format(i_epoch, *metrics))
+            progress_bar.set_description('[ EP {0:02d} ]'
+                                         # '[ TST LS: {5:.3f} PR: {6:.3f} F1: {7:.3f} AC: {8:.3f} ]'
+                                         '[ TST LS: {1:.3f} AC: {5:.3f} ]'
+                                         .format(i_epoch, *metrics))
+
+    # metrics = (
+    #     loss_total / total,
+    #     *p_r_(train_metrics),
+    #     loss_total_test / total_test,
+    #     *p_r_(test_metrics)
+    # )
+    #
+    # progress_bar.set_description('[ EP {0:02d} ]'
+    #                              # '[ TRN LS: {1:.3f} PR: {2:.3f} F1: {3:.3f} AC: {4:.3f}]'
+    #                              '[ TRN LS: {1:.3f} AC: {5:.3f} ]'
+    #                              # '[ TST LS: {5:.3f} PR: {6:.3f} F1: {7:.3f} AC: {8:.3f} ]'
+    #                              '[ TST LS: {6:.3f} AC: {10:.3f} ]'
+    #                              .format(i_epoch, *metrics))
