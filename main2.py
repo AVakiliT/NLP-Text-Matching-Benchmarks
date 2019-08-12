@@ -1,4 +1,5 @@
 import math
+import random
 
 import gensim
 from collections import Counter
@@ -13,6 +14,16 @@ from torch import nn
 from torch.nn import functional as F
 from tqdm import tqdm
 
+#%%
+# torch.backends.cudnn.deterministic = True
+# torch.backends.cudnn.benchmark = False
+
+SEED = 1
+torch.manual_seed(SEED)
+np.random.seed(SEED)
+random.seed(SEED)
+
+
 # %%
 MIN_FREQ = 2
 tokenize = lambda x: x.split()
@@ -23,6 +34,7 @@ device = torch.device('cuda')
 EPSILON = 1e-13
 INF = 1e13
 PAD_FIRST = False
+KEEP = None
 
 # N_EPOCH = 4
 # BATCH_SIZE = 32
@@ -30,19 +42,19 @@ PAD_FIRST = False
 # FIX_LEN = True
 # DATASET_NAME = 'quora'
 
+N_EPOCH = 1
+BATCH_SIZE = 32
+MAX_LEN = 32
+FIX_LEN = False
+DATASET_NAME = 'SciTailV1.1'
+NUM_CLASS=2
+
 # N_EPOCH = 4
 # BATCH_SIZE = 32
-# MAX_LEN = 32
+# MAX_LEN = 30
 # FIX_LEN = False
-# DATASET_NAME = 'SciTailV1.1'
-# NUM_CLASS=2
-
-N_EPOCH = 4
-BATCH_SIZE = 32
-MAX_LEN = 30
-FIX_LEN = False
-DATASET_NAME = 'snli'
-NUM_CLASS = 3
+# DATASET_NAME = 'snli'
+# NUM_CLASS = 3
 
 
 def read_train(fname):
@@ -79,7 +91,7 @@ def read_eval(fname, stoi):
 
 class CustomDataset(Dataset):
 
-    def __init__(self, context_idx, response_idx, labels, keep=None) -> None:
+    def __init__(self, context_idx, response_idx, labels, keep=KEEP) -> None:
         super().__init__()
         self.contexts = context_idx
         self.responses = response_idx
@@ -96,7 +108,7 @@ class CustomDataset(Dataset):
         return self.labels.__len__()
 
 
-print('Reading Dataset...')
+print('Reading Dataset {} ...'.format(DATASET_NAME))
 stoi, itos, question_idx, sentence_idx, labels = read_train(DATASET_NAME + '/train.csv')
 train_dataset = CustomDataset(question_idx, sentence_idx, labels)
 dev_dataset = CustomDataset(*read_eval(DATASET_NAME + '/dev.csv', stoi))
@@ -152,7 +164,7 @@ for i, word in enumerate(itos):
         if i == PAD:
             embedding_weights[i] = torch.zeros(EMBEDDING_DIM)
 
-print(len(unmatch) * 100 / VOCAB_LEN, '% of embeddings didn\'t match')
+print('{:.2f}% of words not in embedding file.'.format(len(unmatch) * 100 / VOCAB_LEN))
 
 
 def get_emb():
@@ -237,7 +249,7 @@ class DiSAN(nn.Module):
 
 class ESIM(nn.Module):
 
-    def __init__(self, emb_dim=EMBEDDING_DIM, hidden_dim=EMBEDDING_DIM):
+    def __init__(self, emb_dim=EMBEDDING_DIM, hidden_dim=EMBEDDING_DIM, num_class=NUM_CLASS):
         super().__init__()
         self.emb = get_emb()
         self.RNN_1 = nn.LSTM(emb_dim, hidden_dim, batch_first=True, bidirectional=True)
@@ -245,7 +257,7 @@ class ESIM(nn.Module):
         self.final = nn.Sequential(
             nn.Linear(2 * 2 * 4 * hidden_dim, hidden_dim),
             nn.ReLU(),
-            nn.Linear(hidden_dim, NUM_CLASS),
+            nn.Linear(hidden_dim, 1 if num_class == 2 else num_class),
         )
 
     def forward(self, x1, x2):
@@ -729,7 +741,7 @@ model = ESIM().to(device)
 LR = 1e-3
 
 
-def calc_metrics(y, y_hat, num_classes=2):
+def calc_confusion_matrix(y, y_hat, num_classes=2):
     with torch.no_grad():
         if num_classes == 2:
             pred = y_hat.gt(0)
@@ -740,9 +752,9 @@ def calc_metrics(y, y_hat, num_classes=2):
     return m
 
 
-def p_r_(m):
-    p = (m.diagonal() / max(m.sum(0), EPSILON)).mean()
-    r = (m.diagonal() / max(m.sum(1), EPSILON)).mean()
+def calc_metrics(m):
+    p = (m.diagonal() / m.sum(0).clip(EPSILON)).mean()
+    r = (m.diagonal() / m.sum(1).clip(EPSILON)).mean()
     f1 = ((2 * p * r) / (p + r)).mean()
     accu = m.diagonal().sum() / m.sum()
     return p, r, f1, accu
@@ -781,15 +793,15 @@ for i_epoch in range(1, N_EPOCH + 1):
 
         loss_total += loss.item()
         total += y.shape[0]
-        train_metrics += calc_metrics(y, y_hat, NUM_CLASS)
+        train_metrics += calc_confusion_matrix(y, y_hat, NUM_CLASS)
 
         metrics = (
             loss_total / total,
-            *p_r_(train_metrics),
+            *calc_metrics(train_metrics),
         )
 
         progress_bar.set_description('[ EP {0:02d} ]'
-                                     # '[ TRN LS: {1:.3f} PR: {2:.3f} F1: {3:.3f} AC: {4:.3f}]'
+                                     # '[ TRN LS: {1:.3f} PR: {2:.3f} F1: {4:.3f} AC: {5:.3f}]'
                                      '[ TRN LS: {1:.3f} AC: {5:.3f} ]'
                                      .format(i_epoch, *metrics))
 
@@ -813,15 +825,15 @@ for i_epoch in range(1, N_EPOCH + 1):
 
             loss_total_test += loss.item()
             total_test += y.shape[0]
-            test_metrics += calc_metrics(y, y_hat, NUM_CLASS)
+            test_metrics += calc_confusion_matrix(y, y_hat, NUM_CLASS)
 
             metrics = (
                 loss_total_test / total_test,
-                *p_r_(test_metrics)
+                *calc_metrics(test_metrics)
             )
 
             progress_bar.set_description('[ EP {0:02d} ]'
-                                         # '[ TST LS: {5:.3f} PR: {6:.3f} F1: {7:.3f} AC: {8:.3f} ]'
+                                         # '[ TST LS: {1:.3f} PR: {2:.3f} F1: {4:.3f} AC: {5:.3f} ]'
                                          '[ TST LS: {1:.3f} AC: {5:.3f} ]'
                                          .format(i_epoch, *metrics))
 
