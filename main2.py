@@ -34,8 +34,6 @@ device = torch.device('cuda')
 EPSILON = 1e-8
 INF = 1e13
 PAD_FIRST = False
-LR = 2e-4
-
 
 # N_EPOCH = 10
 # BATCH_SIZE = 32
@@ -45,12 +43,13 @@ LR = 2e-4
 # NUM_CLASS = 2
 
 N_EPOCH = 10
-BATCH_SIZE = 32
-MAX_LEN = 32
+BATCH_SIZE = 256
+MAX_LEN = 80
 FIX_LEN = False
 DATASET_NAME = 'SciTailV1.1'
-NUM_CLASS=2
+NUM_CLASS = 2
 KEEP = None
+LR = 2e-4
 
 
 # N_EPOCH = 10
@@ -60,6 +59,7 @@ KEEP = None
 # DATASET_NAME = 'snli'
 # NUM_CLASS = 3
 # KEEP = None
+# LR = 10e-4
 
 
 def read_train(fname):
@@ -80,32 +80,50 @@ def read_train(fname):
     stoi = {v: i for i, v in enumerate(itos)}
     context_idx = df.iloc[:, 0].apply(lambda x: ([stoi[i] if i in stoi else UNK for i in x][:MAX_LEN]))
     response_idx = df.iloc[:, 1].apply(lambda x: ([stoi[i] if i in stoi else UNK for i in x][:MAX_LEN]))
+
+    char_counter = Counter(chain.from_iterable(map(list, chain.from_iterable(df.iloc[:, 0])))) + Counter(
+        chain.from_iterable(map(list, chain.from_iterable(df.iloc[:, 1]))))
+    char_itos = ['<UNK>', '<PAD>'] + [k for k, v in char_counter.most_common()]
+    stoi_char = {v: i for i, v in enumerate(char_itos)}
+    context_char_idx = df.iloc[:, 0].apply(lambda y: [[stoi_char[i] for i in x] for x in y][:MAX_LEN])
+    response_char_idx = df.iloc[:, 1].apply(lambda y: [[stoi_char[i] for i in x] for x in y][:MAX_LEN])
+
     labels = df.iloc[:, 2]
-    return stoi, itos, context_idx, response_idx, labels
+    return stoi, itos, stoi_char, char_itos, context_idx, response_idx, context_char_idx, response_char_idx, labels
 
 
-def read_eval(fname, stoi):
+def read_eval(fname, stoi, stoi_char):
     df = pd.read_csv(fname)
     df.iloc[:, 0] = df.iloc[:, 0].apply(tokenize)
     df.iloc[:, 1] = df.iloc[:, 1].apply(tokenize)
-    question_idx = df.iloc[:, 0].apply(lambda x: ([stoi[i] if i in stoi else UNK for i in x][:MAX_LEN]))
-    sentence_idx = df.iloc[:, 1].apply(lambda x: ([stoi[i] if i in stoi else UNK for i in x][:MAX_LEN]))
+    context_idx = df.iloc[:, 0].apply(lambda x: ([stoi[i] if i in stoi else UNK for i in x][:MAX_LEN]))
+    response_idx = df.iloc[:, 1].apply(lambda x: ([stoi[i] if i in stoi else UNK for i in x][:MAX_LEN]))
+
+    context_char_idx = df.iloc[:, 0].apply(
+        lambda y: [[stoi_char[i] if i in stoi_char else UNK for i in x] for x in y][:MAX_LEN])
+    response_char_idx = df.iloc[:, 1].apply(
+        lambda y: [[stoi_char[i] if i in stoi_char else UNK for i in x] for x in y][:MAX_LEN])
+
     labels = df.iloc[:, 2]
-    return question_idx, sentence_idx, labels
+    return context_idx, response_idx, context_char_idx, response_char_idx, labels
 
 
 class CustomDataset(Dataset):
 
-    def __init__(self, context_idx, response_idx, labels, keep=None) -> None:
+    def __init__(self, context_idx, response_idx, context_char_idx, response_char_idx, labels, keep=None) -> None:
         super().__init__()
         if keep is not None:
             index = labels.sample(keep).index
             context_idx = context_idx[index].reset_index(drop=True)
+            context_char_idx = context_char_idx[index].reset_index(drop=True)
             response_idx = response_idx[index].reset_index(drop=True)
+            response_char_idx = response_char_idx[index].reset_index(drop=True)
             labels = labels[index].reset_index(drop=True)
 
         self.contexts = context_idx
+        self.contexts_char = context_char_idx
         self.responses = response_idx
+        self.responses_char = response_char_idx
         self.labels = labels
 
     def __getitem__(self, index: int):
@@ -116,10 +134,11 @@ class CustomDataset(Dataset):
 
 
 print('Reading Dataset {} ...'.format(DATASET_NAME))
-stoi, itos, question_idx, sentence_idx, labels = read_train(DATASET_NAME + '/train.csv')
-train_dataset = CustomDataset(question_idx, sentence_idx, labels, keep=KEEP)
-dev_dataset = CustomDataset(*read_eval(DATASET_NAME + '/dev.csv', stoi))
-test_dataset = CustomDataset(*read_eval(DATASET_NAME + '/test.csv', stoi))
+stoi, itos, stoi_char, char_itos, context_idx, response_idx, context_char_idx, response_char_idx, labels = read_train(
+    DATASET_NAME + '/train.csv')
+train_dataset = CustomDataset(context_idx, response_idx, context_char_idx, response_char_idx, labels, keep=KEEP)
+dev_dataset = CustomDataset(*read_eval(DATASET_NAME + '/dev.csv', stoi, stoi_char))
+test_dataset = CustomDataset(*read_eval(DATASET_NAME + '/test.csv', stoi, stoi_char))
 
 
 # %%
@@ -155,7 +174,7 @@ print('Vocab length is {}'.format(VOCAB_LEN))
 # %%
 print('Reading Embeddings...')
 w2v = gensim.models.KeyedVectors.load_word2vec_format(
-    '/home/amir/IIS/Datasets/embeddings/glove.6B.' + str(EMBEDDING_DIM)
+    'embeddings/glove.6B.' + str(EMBEDDING_DIM)
     + 'd.w2vformat.bin',
     binary=True)
 
@@ -291,11 +310,16 @@ class ESIM(nn.Module):
         c_m = torch.cat([cs, c_hat, cs - c_hat, cs * c_hat], -1)  # BL(8H)
         r_m = torch.cat([rs, r_hat, rs - r_hat, rs * r_hat], -1)
 
+        c_m = c_m.masked_fill(c_mask.unsqueeze(-1), 0)
+        r_m = r_m.masked_fill(r_mask.unsqueeze(-1), 0)
+
         c_v, _ = self.RNN_2(c_m)  # BL(16H)
         r_v, _ = self.RNN_2(r_m)
 
         # v = torch.cat([c_v[:, -1, :], r_v[:, -1, :], c_v.max(1)[0], r_v.max(1)[0],
         #                ], -1)
+        c_v = c_v.masked_fill(c_mask.unsqueeze(-1), 0)
+        r_v = r_v.masked_fill(r_mask.unsqueeze(-1), 0)
 
         vc = torch.cat([c_v[:, -1, :], c_v.max(1)[0]], -1)
         vr = torch.cat([r_v[:, -1, :], r_v.max(1)[0]], -1)
@@ -304,6 +328,7 @@ class ESIM(nn.Module):
         p = self.final(v).squeeze(-1)
 
         return p
+
 
 class ESIM_SAN(nn.Module):
 
@@ -323,10 +348,12 @@ class ESIM_SAN(nn.Module):
         self.gru = nn.GRUCell(hidden_dim * 2, hidden_dim * 2)
 
         self.final = nn.Sequential(
-            nn.Linear(2 * 4 * hidden_dim, hidden_dim),
+            nn.Linear(4 * 2 * hidden_dim, hidden_dim),
             nn.ReLU(),
             nn.Linear(hidden_dim, 1 if num_class == 2 else num_class),
         )
+
+        self.T = 5
 
     def forward(self, x1, x2):
         c_mask = x1 == PAD  # BL
@@ -355,43 +382,40 @@ class ESIM_SAN(nn.Module):
         c_m = torch.cat([cs, c_hat, cs - c_hat, cs * c_hat], -1)  # BL(4H)
         r_m = torch.cat([rs, r_hat, rs - r_hat, rs * r_hat], -1)
 
+        c_m = c_m.masked_fill(c_mask.unsqueeze(-1), 0)
+        r_m = r_m.masked_fill(r_mask.unsqueeze(-1), 0)
+
         c_v, _ = self.RNN_2(c_m)
         r_v, _ = self.RNN_2(r_m)
 
-        # c_v = max_out(c_v, 2) # BL(4H)
-        # r_v = max_out(r_v, 2)
+        c_v = c_v.masked_fill(c_mask.unsqueeze(-1), 0)
+        r_v = r_v.masked_fill(r_mask.unsqueeze(-1), 0)
 
-        # BL
+        x_t = torch.cat([c_v[:, -1, :]], -1)
+        s_t = torch.cat([r_v[:, -1, :]], -1)
+
         p = []
-        s_t = torch.einsum('bmh,bm->bh', [c_v, self.theta2(c_v).squeeze(-1).softmax(-1)])  # Pooling the premise
-
-        for t in range(0, 5):
-            x_t = torch.einsum('bnh,bn->bh', [r_v, torch.einsum('bh,bnh->bn', [s_t, r_v]).softmax(-1)])
-            p_t = self.final(torch.cat([x_t, s_t, x_t - s_t, x_t * s_t], -1)).squeeze(-1)
+        for t in range(self.T):
+            p_t = self.final(torch.cat([s_t, x_t, s_t - x_t, s_t * x_t], -1)).squeeze(-1)
             p.append(p_t)
-            if t != 5:
-                s_t = self.gru(x_t, s_t)
+
+            if t != self.T - 1:
+                beta = torch.einsum('bh,hj,bmj->bm', [s_t, self.theta3, c_v]).softmax(-1)
+                x_t = torch.einsum('bm,bmh->bh', [beta, c_v])  # x_{t+1}
+                s_t = self.gru(x_t, s_t)  # s_{t}
 
         p = torch.stack(p)
         p = p.mean(0)
-
-        # v = torch.cat([c_v[:, -1, :], r_v[:, -1, :], c_v.max(1)[0], r_v.max(1)[0],
-        #                ], -1)
-
-        # vc = torch.cat([c_v[:, -1, :], c_v.max(1)[0]], -1)
-        # vr = torch.cat([r_v[:, -1, :], r_v.max(1)[0]], -1)
-        # v = torch.cat([vc, vr, vc - vr, vc * vr], -1)
-        #
-        # p = self.final(v).squeeze(-1)
-
         return p
+
+
 def max_out(x, pool_size):
     return x.view(*x.shape[:-1], x.shape[-1] // pool_size, pool_size).max(-1)[0]
 
 
 class SAN(nn.Module):
 
-    def __init__(self, emb_dim=EMBEDDING_DIM, hidden_dim=EMBEDDING_DIM, num_class=NUM_CLASS):
+    def __init__(self, emb_dim=EMBEDDING_DIM, hidden_dim=EMBEDDING_DIM, num_class=NUM_CLASS, T=5):
         super().__init__()
         self.emb = get_emb()
         self.pwffn = nn.Sequential(
@@ -405,17 +429,18 @@ class SAN(nn.Module):
 
         self.pre_attention_linear = nn.Linear(hidden_dim * 2, hidden_dim * 2)
 
-        self.gru = nn.GRUCell(hidden_dim * 4, hidden_dim * 4)
+        self.gru = nn.GRUCell(hidden_dim * 8, hidden_dim * 8)
 
-        self.theta2 = nn.Linear(hidden_dim * 4, 1, bias=False)
+        self.theta2 = nn.Linear(hidden_dim * 8, 1, bias=False)
 
         # self.theta3 = nn.Bilinear(hidden_dim * 8, hidden_dim * 8, 1)
         self.theta3 = nn.Parameter(torch.zeros(hidden_dim * 8, hidden_dim * 8))
-        bound = 1/math.sqrt(hidden_dim * 4)
+        bound = 1 / math.sqrt(hidden_dim * 8)
         init.uniform_(self.theta3, -bound, bound)
 
-        self.theta4 = nn.Linear(hidden_dim * 4 * 4, 1 if NUM_CLASS == 2 else NUM_CLASS, bias=False)
+        self.theta4 = nn.Linear(hidden_dim * 4 * 8, 1 if num_class == 2 else num_class, bias=False)
 
+        self.T = T
         # self.final = nn.Sequential(
         #     nn.Linear(2 * 2 * 4 * hidden_dim, hidden_dim),
         #     nn.ReLU(),
@@ -466,19 +491,19 @@ class SAN(nn.Module):
         c_m, _ = self.RNN_3(c_u)  # BL(8H)
         r_m, _ = self.RNN_3(r_u)
 
-        c_m = max_out(c_m, 2)
-        r_m = max_out(r_m, 2)
-
+        # c_m = max_out(c_m, 2)
+        # r_m = max_out(r_m, 2)
 
         # BL
         p = []
-        s_t = torch.einsum('bmh,bm->bh', [c_m, self.theta2(c_m).squeeze(-1).softmax(-1)])  # Pooling the premise
+        s_t = torch.einsum('bmh,bm->bh', [r_m, self.theta2(r_m).squeeze(-1).softmax(-1)])  # Pooling the hypothesis
 
-        for t in range(0, 5):
-            x_t = torch.einsum('bnh,bn->bh', [r_m, torch.einsum('bh,bnh->bn', [s_t, r_m]).softmax(-1)])
+        for t in range(0, self.T):
+            beta = torch.einsum('bh,hj,bmj->bm', [s_t, self.theta3, c_m]).softmax(-1)
+            x_t = torch.einsum('bmh,bm->bh', [c_m, beta])
             p_t = self.theta4(torch.cat([x_t, s_t, x_t - s_t, x_t * s_t], -1)).squeeze(-1)
             p.append(p_t)
-            if t != 5:
+            if t != self.T - 1:
                 s_t = self.gru(x_t, s_t)
 
         p = torch.stack(p)
@@ -488,6 +513,7 @@ class SAN(nn.Module):
 
         return p
 
+
 class SAN_light(nn.Module):
 
     def __init__(self, emb_dim=EMBEDDING_DIM, hidden_dim=EMBEDDING_DIM, num_class=NUM_CLASS):
@@ -495,19 +521,19 @@ class SAN_light(nn.Module):
         self.emb = get_emb()
 
         self.RNN_1 = nn.LSTM(emb_dim, hidden_dim, batch_first=True, bidirectional=True)
-        self.RNN_3 = nn.LSTM(hidden_dim * 2, hidden_dim * 2, batch_first=True, bidirectional=True)
+        self.RNN_2 = nn.LSTM(emb_dim, hidden_dim, batch_first=True, bidirectional=True)
+        self.RNN_3 = nn.LSTM(hidden_dim * 4, hidden_dim * 4, batch_first=True, bidirectional=True)
 
+        self.gru = nn.GRUCell(hidden_dim * 4, hidden_dim * 4)
 
-        self.gru = nn.GRUCell(hidden_dim * 2, hidden_dim * 2)
-
-        self.theta2 = nn.Linear(hidden_dim * 2, 1, bias=False)
+        self.theta2 = nn.Linear(hidden_dim * 4, 1, bias=False)
 
         # self.theta3 = nn.Bilinear(hidden_dim * 8, hidden_dim * 8, 1)
         self.theta3 = nn.Parameter(torch.zeros(hidden_dim * 8, hidden_dim * 8))
-        bound = 1/math.sqrt(hidden_dim * 2)
+        bound = 1 / math.sqrt(hidden_dim * 4)
         init.uniform_(self.theta3, -bound, bound)
 
-        self.theta4 = nn.Linear(hidden_dim * 2 * 4, 1 if NUM_CLASS == 2 else NUM_CLASS, bias=False)
+        self.theta4 = nn.Linear(hidden_dim * 4 * 4, 1 if NUM_CLASS == 2 else NUM_CLASS, bias=False)
 
         # self.final = nn.Sequential(
         #     nn.Linear(2 * 2 * 4 * hidden_dim, hidden_dim),
@@ -523,11 +549,20 @@ class SAN_light(nn.Module):
 
         xx1, xx2 = self.emb(x1), self.emb(x2)
 
-        cs, _ = self.RNN_1(xx1)  # BL(2H)
-        rs, _ = self.RNN_1(xx2)
+        cs1, _ = self.RNN_1(xx1)  # BL(2H)
+        rs1, _ = self.RNN_1(xx2)
 
-        cs = max_out(cs, 2)
-        rs = max_out(rs, 2)
+        cs1 = max_out(cs1, 2)
+        rs1 = max_out(rs1, 2)
+
+        cs2, _ = self.RNN_2(cs1)
+        rs2, _ = self.RNN_2(rs1)
+
+        cs2 = max_out(cs2, 2)
+        rs2 = max_out(rs2, 2)
+
+        cs = torch.cat([cs1, cs2], -1)  # BL2H
+        rs = torch.cat([rs1, rs2], -1)
 
         att = torch.einsum('bmh,bnh->bmn', [cs, rs])
 
@@ -552,7 +587,6 @@ class SAN_light(nn.Module):
         c_m = max_out(c_m, 2)
         r_m = max_out(r_m, 2)
 
-
         # BL
         p = []
         s_t = torch.einsum('bmh,bm->bh', [c_m, self.theta2(c_m).squeeze(-1).softmax(-1)])  # Pooling the premise
@@ -561,7 +595,7 @@ class SAN_light(nn.Module):
             x_t = torch.einsum('bnh,bn->bh', [r_m, torch.einsum('bh,bnh->bn', [s_t, r_m]).softmax(-1)])
             p_t = self.theta4(torch.cat([x_t, s_t, x_t - s_t, x_t * s_t], -1)).squeeze(-1)
             p.append(p_t)
-            if t != self.T-1:
+            if t != self.T - 1:
                 s_t = self.gru(x_t, s_t)
 
         p = torch.stack(p)
@@ -570,6 +604,7 @@ class SAN_light(nn.Module):
         # p = self.final(v).squeeze(-1)
 
         return p
+
 
 class REE(nn.Module):
     class Block(nn.Module):
@@ -1007,17 +1042,16 @@ class RNN(nn.Module):
 # model = REE()
 # model = CustomREE()
 # model = RNN()
-# model = ESIM()
+model = ESIM()
 # model = CompAgg()
 # model = DiSAN()
 # model = BiMPM()
 # model = FlatSMN()
-# model = SAN()
-model = SAN_light()
+# model = SAN(T=5)
+# model = SAN_light()
 # model = ESIM_SAN()
 
 model = model.to(device)
-
 
 
 def calc_confusion_matrix(y, y_hat, num_classes=2):
@@ -1039,6 +1073,7 @@ def calc_metrics(m):
     return p, r, f1, accu
 
 
+# optimizer = torch.optim.Adamax(params=model.parameters())
 optimizer = torch.optim.Adam(lr=LR, params=model.parameters())
 
 # train_weights = (1 / train_dataset.labels.value_counts(normalize=True))
@@ -1080,8 +1115,8 @@ for i_epoch in range(1, N_EPOCH + 1):
         )
 
         progress_bar.set_description(Fore.RESET + '[ EP {0:02d} ]'
-                                     # '[ TRN LS: {1:.3f} PR: {2:.3f} F1: {4:.3f} AC: {5:.3f}]'
-                                     '[ TRN LS: {1:.3f} AC: {5:.3f} ]'
+        # '[ TRN LS: {1:.4f} PR: {2:.4f} F1: {4:.4f} AC: {5:.4f}]'
+                                                  '[ TRN LS: {1:.4f} AC: {5:.4f} ]'
                                      .format(i_epoch, *metrics))
 
     model.eval()
@@ -1111,9 +1146,9 @@ for i_epoch in range(1, N_EPOCH + 1):
                 *calc_metrics(dev_metrics)
             )
 
-            progress_bar.set_description(Fore.GREEN + '[ EP {0:02d} ]'
-                                         # '[ TST LS: {1:.3f} PR: {2:.3f} F1: {4:.3f} AC: {5:.3f} ]'
-                                         '[ DEV LS: {1:.3f} AC: {5:.3f} ]'
+            progress_bar.set_description(Fore.BLUE + '[ EP {0:02d} ]'
+            # '[ TST LS: {1:.4f} PR: {2:.4f} F1: {4:.4f} AC: {5:.4f} ]'
+                                                     '[ DEV LS: {1:.4f} AC: {5:.4f} ]'
                                          .format(i_epoch, *metrics))
 
     # model.eval()
@@ -1144,10 +1179,9 @@ for i_epoch in range(1, N_EPOCH + 1):
     #         )
     #
     #         progress_bar.set_description(Fore.YELLOW + '[ EP {0:02d} ]'
-    #         # '[ TST LS: {1:.3f} PR: {2:.3f} F1: {4:.3f} AC: {5:.3f} ]'
-    #                                                    '[ TST LS: {1:.3f} AC: {5:.3f} ]'
+    #         # '[ TST LS: {1:.4f} PR: {2:.4f} F1: {4:.4f} AC: {5:.4f} ]'
+    #                                                    '[ TST LS: {1:.4f} AC: {5:.4f} ]'
     #                                      .format(i_epoch, *metrics))
-
 
     # metrics = (
     #     loss_total / total,
@@ -1157,8 +1191,8 @@ for i_epoch in range(1, N_EPOCH + 1):
     # )
     #
     # progress_bar.set_description('[ EP {0:02d} ]'
-    #                              # '[ TRN LS: {1:.3f} PR: {2:.3f} F1: {3:.3f} AC: {4:.3f}]'
-    #                              '[ TRN LS: {1:.3f} AC: {5:.3f} ]'
-    #                              # '[ TST LS: {5:.3f} PR: {6:.3f} F1: {7:.3f} AC: {8:.3f} ]'
-    #                              '[ TST LS: {6:.3f} AC: {10:.3f} ]'
+    #                              # '[ TRN LS: {1:.4f} PR: {2:.4f} F1: {3:.4f} AC: {4:.4f}]'
+    #                              '[ TRN LS: {1:.4f} AC: {5:.4f} ]'
+    #                              # '[ TST LS: {5:.4f} PR: {6:.4f} F1: {7:.4f} AC: {8:.4f} ]'
+    #                              '[ TST LS: {6:.4f} AC: {10:.4f} ]'
     #                              .format(i_epoch, *metrics))
