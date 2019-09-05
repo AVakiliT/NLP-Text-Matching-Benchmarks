@@ -6,7 +6,7 @@ from multiprocessing import Pool
 import numpy as np
 import pandas as pd
 import torch
-from pytorch_transformers import BertTokenizer, DistilBertForSequenceClassification
+from pytorch_transformers import BertTokenizer, DistilBertForSequenceClassification, BertForSequenceClassification
 from torch.optim import AdamW
 from torch.utils.data import TensorDataset, DataLoader
 from tqdm import tqdm
@@ -89,7 +89,7 @@ def read_data(fname):
     token_ids_matrix = np.array(token_ids).astype('int64')
     sep_idx = token_ids_matrix.__eq__(SEP).argmax(1)
     mask_matrix = [[i < sep_idx[j] for i in range(MAX_TOTAL_LEN)] for j in range(len(token_ids_matrix))]
-    mask_matrix = np.array(mask_matrix).astype('float')
+    mask_matrix = np.array(mask_matrix).astype('int64')
 
     _dataset = TensorDataset(torch.tensor(token_ids_matrix), torch.tensor(mask_matrix),
                              torch.tensor(np.array(df.iloc[:, 2])))
@@ -111,6 +111,8 @@ test_data_loader = read_data(DATASET_NAME + '/test.csv')
 
 model = DistilBertForSequenceClassification.from_pretrained(
     "distilbert-base-uncased", num_labels=NUM_CLASS)
+# model = BertForSequenceClassification.from_pretrained(
+#     "bert-base-uncased", num_labels=NUM_CLASS)
 model = model.cuda()
 
 # %%
@@ -156,7 +158,8 @@ for ep in range(epochs):
         # Clear out the gradients (by default they accumulate)
         optimizer.zero_grad()
         # Forward pass
-        loss, logits = model(b_input_ids, attention_mask=b_input_mask, labels=b_labels)
+        attn_mask = ~b_input_ids.eq(PAD)
+        loss, logits = model(b_input_ids, attention_mask=attn_mask, labels=b_labels)
 
         acc += logits.argmax(1).eq(b_labels).long().sum().item()
         train_loss_set.append(loss.item())
@@ -196,7 +199,8 @@ for ep in range(epochs):
             b_input_ids, b_input_mask, b_labels = batch
             # Clear out the gradients (by default they accumulate)
             # Forward pass
-            loss, logits = model(b_input_ids, attention_mask=b_input_mask, labels=b_labels)
+            attn_mask = ~b_input_ids.eq(PAD)
+            loss, logits = model(b_input_ids, attention_mask=attn_mask, labels=b_labels)
 
             acc += logits.argmax(1).eq(b_labels).long().sum().item()
 
