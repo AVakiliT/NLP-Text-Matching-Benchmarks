@@ -1,33 +1,30 @@
-import numpy as np
-from matplotlib.path import Path
-from joblib import Parallel, delayed
+import math
 import time
-import sys
+from multiprocessing.pool import Pool
+from joblib import Parallel, delayed
 
 
-## Check if one line segment contains another.
+def f(x):
+    return math.sqrt(x ** 2)
 
-def check_paths(path):
-    # global a
-    # print(path, a[:10])
-    res = 'no cross'
-    for other_path in a:
-        if other_path.contains_path(path) == 1:
-            res = 'cross'
-            break
-    return res
+n = 2_000_000
+
+now = time.time()
+a = [f(x) for x in range(n)]
+print(time.time() - now)
+
+now = time.time()
+with Pool(16) as pool:
+    a = pool.map(f, range(n))
+print(time.time() - now)
+
+now = time.time()
+a = Parallel(n_jobs=16)(delayed(f)(x) for x in range(n))
+print(time.time() - now)
+
+now = time.time()
+a = Parallel(n_jobs=16, backend='multiprocessing')(delayed(f)(x) for x in range(n))
+print(time.time() - now)
 
 
-if __name__ == '__main__':
-    ## Create pairs of points for line segments
-    a = zip(np.random.rand(5000, 2), np.random.rand(5000, 2))
-    a = [Path(x) for x in a]
 
-    b = zip(np.random.rand(300, 2), np.random.rand(300, 2))
-
-    now = time.time()
-    if len(sys.argv) >= 2:
-        res = Parallel(n_jobs=int(sys.argv[1]))(delayed(check_paths)(Path(points)) for points in b)
-    else:
-        res = [check_paths(Path(points)) for points in b]
-    print("Finished in", time.time() - now, "sec")
