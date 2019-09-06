@@ -38,23 +38,23 @@ PAD_FIRST = False
 # DATASET_NAME = 'quora'
 # NUM_CLASS = 2
 
-# N_EPOCH = 10
-# BATCH_SIZE = 32
-# MAX_LEN = 60
-# FIX_LEN = False
-# DATASET_NAME = 'SciTailV1.1'
-# NUM_CLASS = 2
-# KEEP = None
-# LR = 2e-4
-
 N_EPOCH = 10
 BATCH_SIZE = 32
-MAX_LEN = 30
+MAX_LEN = 60
 FIX_LEN = False
-DATASET_NAME = 'snli'
-NUM_CLASS = 3
+DATASET_NAME = 'SciTailV1.1'
+NUM_CLASS = 2
 KEEP = None
-LR = 10e-4
+LR = 2e-4
+
+# N_EPOCH = 10
+# BATCH_SIZE = 32
+# MAX_LEN = 30
+# FIX_LEN = False
+# DATASET_NAME = 'snli'
+# NUM_CLASS = 3
+# KEEP = None
+# LR = 10e-4
 
 MAX_TOTAL_LEN = MAX_LEN * 2 + 1
 
@@ -80,13 +80,11 @@ def read_data(fname):
 
     df['text'] = df.apply(lambda row: '[CLS] ' + row[0] + ' [SEP] ' + row[1] + ' [SEP]', axis=1)
 
-    # tokenized_texts = df.text.apply(lambda x: tokenizer.tokenize(x))
-    # token_ids = tokenized_texts.apply(tokenizer.convert_tokens_to_ids)
-    # token_ids = token_ids.apply(truncate)
-    # token_ids = token_ids.apply(lambda x: x + [0] * max(0, MAX_TOTAL_LEN - len(x))).tolist()
-
-    with Pool(processes=os.cpu_count() // 2) as pool:
-        token_ids = pool.map(f, df.text)
+    if os.name == 'nt':  # Because windows is a piece of shit that cant even fork processes
+        token_ids = list(map(f, df.text))
+    else:
+        with Pool(processes=os.cpu_count() // 2) as pool:
+            token_ids = pool.map(f, df.text)
 
     token_ids_matrix = np.array(token_ids).astype('int64')
     sep_idx = token_ids_matrix.__eq__(SEP).argmax(1)
@@ -106,7 +104,6 @@ PAD, SEP, CLS = tokenizer.vocab['[PAD]'], tokenizer.vocab['[SEP]'], tokenizer.vo
 now = time.time()
 train_data_loader = read_data(DATASET_NAME + '/train.csv')
 print(time.time() - now)
-# %%
 dev_data_loader = read_data(DATASET_NAME + '/dev.csv')
 test_data_loader = read_data(DATASET_NAME + '/test.csv')
 
@@ -175,7 +172,7 @@ for ep in range(epochs):
 
         p_bar.set_description('Loss {:.4f} Acc {:.4f}'.format(tr_loss / nb_tr_steps, acc / nb_tr_examples))
 
-    print("Train loss: {}".format(tr_loss / nb_tr_steps))
+    # print("Train loss: {}".format(tr_loss / nb_tr_steps))
 
     #   print('EPOCH', ep)
 
@@ -210,4 +207,4 @@ for ep in range(epochs):
 
             p_bar.set_description('Loss {:.4f} Acc {:.4f}'.format(ts_loss / nb_ts_steps, acc / nb_ts_examples))
 
-        print("test loss: {}".format(ts_loss / nb_ts_steps))
+        # print("test loss: {}".format(ts_loss / nb_ts_steps))
