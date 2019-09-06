@@ -38,23 +38,23 @@ PAD_FIRST = False
 # DATASET_NAME = 'quora'
 # NUM_CLASS = 2
 
-N_EPOCH = 10
-BATCH_SIZE = 32
-MAX_LEN = 60
-FIX_LEN = False
-DATASET_NAME = 'SciTailV1.1'
-NUM_CLASS = 2
-KEEP = None
-LR = 2e-4
-
 # N_EPOCH = 10
 # BATCH_SIZE = 32
-# MAX_LEN = 30
+# MAX_LEN = 60
 # FIX_LEN = False
-# DATASET_NAME = 'snli'
-# NUM_CLASS = 3
+# DATASET_NAME = 'SciTailV1.1'
+# NUM_CLASS = 2
 # KEEP = None
-# LR = 10e-4
+# LR = 2e-4
+
+N_EPOCH = 10
+BATCH_SIZE = 32
+MAX_LEN = 30
+FIX_LEN = False
+DATASET_NAME = 'snli'  # 0.8851
+NUM_CLASS = 3
+KEEP = None
+LR = 10e-4
 
 MAX_TOTAL_LEN = MAX_LEN * 2 + 1
 

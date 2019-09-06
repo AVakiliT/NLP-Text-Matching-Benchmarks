@@ -35,21 +35,23 @@ EPSILON = 1e-8
 INF = 1e13
 PAD_FIRST = False
 
-# N_EPOCH = 10
-# BATCH_SIZE = 32
-# MAX_LEN = 25
-# FIX_LEN = True
-# DATASET_NAME = 'quora'
-# NUM_CLASS = 2
-
 N_EPOCH = 10
-BATCH_SIZE = 256
-MAX_LEN = 80
-FIX_LEN = False
-DATASET_NAME = 'SciTailV1.1'
+BATCH_SIZE = 32
+MAX_LEN = 25
+FIX_LEN = True
+DATASET_NAME = 'quora'
 NUM_CLASS = 2
 KEEP = None
-LR = 2e-4
+LR = 10e-4
+
+# N_EPOCH = 10
+# BATCH_SIZE = 256
+# MAX_LEN = 80
+# FIX_LEN = False
+# DATASET_NAME = 'SciTailV1.1'
+# NUM_CLASS = 2
+# KEEP = None
+# LR = 2e-4
 
 
 # N_EPOCH = 10
@@ -196,7 +198,7 @@ print('{:.2f}% of words not in embedding file.'.format(len(unmatch) * 100 / VOCA
 def get_emb():
     if True:
         emb = nn.Embedding(VOCAB_LEN, EMBEDDING_DIM, padding_idx=PAD, _weight=embedding_weights.clone())
-        emb.weight.requires_grad = False
+        # emb.weight.requires_grad = False
         return emb
     else:
         return nn.Embedding(VOCAB_LEN, EMBEDDING_DIM, padding_idx=PAD)
@@ -606,7 +608,7 @@ class SAN_light(nn.Module):
         return p
 
 
-class REE(nn.Module):
+class RE2(nn.Module):
     class Block(nn.Module):
 
         def __init__(self, dim_in, dim, n_inputs=2):
@@ -683,9 +685,9 @@ class REE(nn.Module):
     def __init__(self):
         super().__init__()
         self.emb = get_emb()
-        self.block1 = REE.Block(EMBEDDING_DIM, EMBEDDING_DIM, n_inputs=2)
-        self.block2 = REE.Block(2 * EMBEDDING_DIM, EMBEDDING_DIM, n_inputs=3)
-        self.block3 = REE.Block(2 * EMBEDDING_DIM, EMBEDDING_DIM, n_inputs=3)
+        self.block1 = RE2.Block(EMBEDDING_DIM, EMBEDDING_DIM, n_inputs=2)
+        self.block2 = RE2.Block(2 * EMBEDDING_DIM, EMBEDDING_DIM, n_inputs=3)
+        self.block3 = RE2.Block(2 * EMBEDDING_DIM, EMBEDDING_DIM, n_inputs=3)
         self.h = nn.Sequential(
             nn.Linear(4 * EMBEDDING_DIM, EMBEDDING_DIM),
             nn.ReLU(),
@@ -794,9 +796,9 @@ class CustomREE(nn.Module):
     def __init__(self):
         super().__init__()
         self.emb = get_emb()
-        self.block1 = REE.Block(EMBEDDING_DIM, EMBEDDING_DIM)
-        self.block2 = REE.Block(2 * EMBEDDING_DIM, EMBEDDING_DIM)
-        self.block3 = REE.Block(2 * EMBEDDING_DIM, EMBEDDING_DIM)
+        self.block1 = RE2.Block(EMBEDDING_DIM, EMBEDDING_DIM)
+        self.block2 = RE2.Block(2 * EMBEDDING_DIM, EMBEDDING_DIM)
+        self.block3 = RE2.Block(2 * EMBEDDING_DIM, EMBEDDING_DIM)
         self.h = nn.Sequential(
             nn.Linear(4 * EMBEDDING_DIM, EMBEDDING_DIM),
             nn.ReLU(),
@@ -1039,17 +1041,17 @@ class RNN(nn.Module):
 
 
 # %%
-# model = REE()
+# model = RE2()
 # model = CustomREE()
 # model = RNN()
-model = ESIM()
+# model = ESIM()
 # model = CompAgg()
 # model = DiSAN()
 # model = BiMPM()
 # model = FlatSMN()
 # model = SAN(T=5)
 # model = SAN_light()
-# model = ESIM_SAN()
+model = ESIM_SAN()
 
 model = model.to(device)
 
@@ -1080,8 +1082,12 @@ optimizer = torch.optim.Adam(lr=LR, params=model.parameters())
 # train_weights = train_weights.to_numpy() / train_weights.sum()
 # train_weights = torch.Tensor(train_weights).to(device)
 
-# progress_bar = tqdm(range(1, N_EPOCH + 1))
-# for i_epoch in progress_bar:
+
+# def dont_update_unkown_words(model):
+#     indices = torch.LongTensor([UNK]).to(device)
+#     model.emb.weight.grad[indices] = 0
+
+
 for i_epoch in range(1, N_EPOCH + 1):
     model.train()
     loss_total = 0
@@ -1101,6 +1107,8 @@ for i_epoch in range(1, N_EPOCH + 1):
             loss = F.binary_cross_entropy_with_logits(y_hat, y.float(), reduction='sum')
         else:
             loss = F.cross_entropy(y_hat, y, reduction='sum')
+            
+        # dont_update_unkown_words(model)
 
         loss.backward()
         optimizer.step()
