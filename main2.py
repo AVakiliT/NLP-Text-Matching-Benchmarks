@@ -35,17 +35,18 @@ EPSILON = 1e-8
 INF = 1e13
 PAD_FIRST = False
 
-N_EPOCH = 10
-BATCH_SIZE = 32
-MAX_LEN = 25
-FIX_LEN = True
-DATASET_NAME = 'quora'
-NUM_CLASS = 2
-KEEP = None
-LR = 10e-4
+# N_EPOCH = 10
+# BATCH_SIZE = 32
+# MAX_LEN = 25
+# FIX_LEN = True
+# DATASET_NAME = 'quora'
+# NUM_CLASS = 2
+# KEEP = None
+# LR = 10e-4
+# MIN_FREQ = 15
 
 # N_EPOCH = 10
-# BATCH_SIZE = 256
+# BATCH_SIZE = 128
 # MAX_LEN = 80
 # FIX_LEN = False
 # DATASET_NAME = 'SciTailV1.1'
@@ -54,14 +55,14 @@ LR = 10e-4
 # LR = 2e-4
 
 
-# N_EPOCH = 10
-# BATCH_SIZE = 32
-# MAX_LEN = 30
-# FIX_LEN = False
-# DATASET_NAME = 'snli'
-# NUM_CLASS = 3
-# KEEP = None
-# LR = 10e-4
+N_EPOCH = 10
+BATCH_SIZE = 32
+MAX_LEN = 30
+FIX_LEN = False
+DATASET_NAME = 'snli'
+NUM_CLASS = 3
+KEEP = None
+LR = 10e-4
 
 
 def read_train(fname):
@@ -613,7 +614,12 @@ class RE2(nn.Module):
 
         def __init__(self, dim_in, dim, n_inputs=2):
             super().__init__()
-            self.conv = nn.Conv1d(in_channels=dim_in, out_channels=dim, kernel_size=3, padding=3 // 2)
+            # self.conv = nn.Conv1d(in_channels=dim_in, out_channels=dim, kernel_size=3, padding=3 // 2)
+            self.convs = nn.Sequential(
+                nn.Conv1d(in_channels=dim_in, out_channels=dim, kernel_size=3, padding=3 // 2),
+                nn.ReLU(),
+                nn.Conv1d(in_channels=dim_in, out_channels=dim, kernel_size=3, padding=3 // 2),
+            )
             self.bilstm = nn.LSTM(dim_in, dim // 2, bidirectional=True)
             dim_ = dim * n_inputs
             self.f = nn.Linear(dim_, dim_)
@@ -691,7 +697,7 @@ class RE2(nn.Module):
         self.h = nn.Sequential(
             nn.Linear(4 * EMBEDDING_DIM, EMBEDDING_DIM),
             nn.ReLU(),
-            nn.Linear(EMBEDDING_DIM, 1)
+            nn.Linear(EMBEDDING_DIM, 1 if NUM_CLASS == 2 else NUM_CLASS)
         )
 
         # for p in self.block1.parameters():
@@ -1040,8 +1046,28 @@ class RNN(nn.Module):
         return y_hat
 
 
+class DualTransformer(nn.Module):
+
+    def __init__(self):
+        super().__init__()
+        self.emb = get_emb()
+        self.rnn = nn.Transformer(EMBEDDING_DIM, )
+        self.final = nn.Linear(400 * 4, 1 if NUM_CLASS == 2 else NUM_CLASS)
+
+    def forward(self, x1, x2):
+        xx1 = self.emb(x1)
+        xx2 = self.emb(x2)
+        xx1 = self.rnn(xx1)[0][:, -1, :]
+        xx2 = self.rnn(xx2)[0][:, -1, :]
+
+        m = torch.cat([xx1, xx2, xx1 - xx2, xx1 * xx2], -1)
+        y_hat = self.final(m)
+
+        return y_hat
+
+
 # %%
-# model = RE2()
+model = RE2()
 # model = CustomREE()
 # model = RNN()
 # model = ESIM()
@@ -1051,7 +1077,7 @@ class RNN(nn.Module):
 # model = FlatSMN()
 # model = SAN(T=5)
 # model = SAN_light()
-model = ESIM_SAN()
+# model = ESIM_SAN()
 
 model = model.to(device)
 
@@ -1096,11 +1122,12 @@ for i_epoch in range(1, N_EPOCH + 1):
     train_metrics = np.zeros((NUM_CLASS, NUM_CLASS))
 
     progress_bar = tqdm(train_data_loader)
-    for x1, x2, y in progress_bar:
+    for batch in progress_bar:
         # for x1, x2, y in train_data_loader:
         optimizer.zero_grad()
         # weights = train_weights[y]
-        x1, x2, y = x1.to(device), x2.to(device), y.to(device)
+        batch = tuple(i.to(device) for i in batch)
+        x1, x2, y = batch
         y_hat = model(x1, x2)
 
         if NUM_CLASS == 2:
