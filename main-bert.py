@@ -6,7 +6,9 @@ from multiprocessing import Pool
 import numpy as np
 import pandas as pd
 import torch
-from pytorch_transformers import BertTokenizer, DistilBertForSequenceClassification, BertForSequenceClassification
+from pytorch_transformers import BertTokenizer, DistilBertForSequenceClassification, BertForSequenceClassification, \
+    DistilBertModel
+from torch import nn
 from torch.optim import AdamW
 from torch.utils.data import TensorDataset, DataLoader
 from tqdm import tqdm
@@ -25,8 +27,7 @@ random.seed(SEED)
 
 # %%
 MIN_FREQ = 2
-EMBEDDING_DIM = 200
-device = torch.device('cuda')
+# EMBEDDING_DIM = 200
 EPSILON = 1e-8
 INF = 1e13
 PAD_FIRST = False
@@ -38,23 +39,23 @@ PAD_FIRST = False
 # DATASET_NAME = 'quora'
 # NUM_CLASS = 2
 
+N_EPOCH = 10
+BATCH_SIZE = 8
+MAX_LEN = 60
+FIX_LEN = False
+DATASET_NAME = 'SciTailV1.1'
+NUM_CLASS = 2
+KEEP = None
+LR = 2e-4
+
 # N_EPOCH = 10
 # BATCH_SIZE = 32
-# MAX_LEN = 60
+# MAX_LEN = 30
 # FIX_LEN = False
-# DATASET_NAME = 'SciTailV1.1'
-# NUM_CLASS = 2
+# DATASET_NAME = 'snli'  # 0.8851
+# NUM_CLASS = 3
 # KEEP = None
-# LR = 2e-4
-
-N_EPOCH = 10
-BATCH_SIZE = 32
-MAX_LEN = 30
-FIX_LEN = False
-DATASET_NAME = 'snli'  # 0.8851
-NUM_CLASS = 3
-KEEP = None
-LR = 10e-4
+# LR = 10e-4
 
 MAX_TOTAL_LEN = MAX_LEN * 2 + 1
 
@@ -109,11 +110,45 @@ test_data_loader = read_data(DATASET_NAME + '/test.csv')
 
 # %%
 
-model = DistilBertForSequenceClassification.from_pretrained(
-    "distilbert-base-uncased", num_labels=NUM_CLASS)
-# model = BertForSequenceClassification.from_pretrained(
-#     "bert-base-uncased", num_labels=NUM_CLASS)
-model = model.cuda()
+# model = DistilBertForSequenceClassification.from_pretrained(
+#     "distilbert-base-uncased", num_labels=NUM_CLASS, output_hidden_states=True)
+# # model = BertForSequenceClassification.from_pretrained(
+# #     "bert-base-uncased", num_labels=NUM_CLASS)
+# model = model.to(device)
+
+#%%
+class CustomBert(nn.Module):
+    class ESIM(nn.Module):
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.rnn = nn.LSTM()
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.bert_model = DistilBertModel.from_pretrained("distilbert-base-uncased", output_hidden_states=True)
+
+        self.final = nn.Sequential(
+            nn.Linear(768 * 4, 768),
+            nn.ReLU(),
+            nn.Linear(768, NUM_CLASS)
+        )
+
+
+    def forward(self, x, att_mask):
+        _, hiddens = self.bert_model(x, attention_mask=att_mask)
+
+        a = hiddens[-1]
+        a_hat = hiddens[-2]
+
+
+
+        o = self.final(m).squeeze()
+
+        return o
+
+model = CustomBert()
+model = model.to(device)
 
 # %%
 param_optimizer = list(model.named_parameters())
@@ -133,6 +168,8 @@ train_loss_set = []
 
 # Number of training epochs (authors recommend between 2 and 4)
 epochs = 4
+
+criterion = nn.CrossEntropyLoss()
 
 # trange is a tqdm wrapper around the normal python range
 for ep in range(epochs):
@@ -159,7 +196,9 @@ for ep in range(epochs):
         optimizer.zero_grad()
         # Forward pass
         attn_mask = ~b_input_ids.eq(PAD)
-        loss, logits = model(b_input_ids, attention_mask=attn_mask, labels=b_labels)
+        logits = model(b_input_ids, attn_mask)
+
+        loss = criterion(logits, b_labels)
 
         acc += logits.argmax(1).eq(b_labels).long().sum().item()
         train_loss_set.append(loss.item())

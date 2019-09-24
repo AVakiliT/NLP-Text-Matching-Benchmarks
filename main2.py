@@ -1,4 +1,6 @@
 import math
+import os
+import pickle
 import random
 
 import gensim
@@ -10,14 +12,56 @@ import torch
 from colorama import Fore
 from nltk import word_tokenize
 from sklearn.metrics import confusion_matrix
+from texttable import Texttable
 from torch.utils.data import Dataset, DataLoader, Sampler
 from torch import nn
 from torch.nn import functional as F, init
 from tqdm import tqdm
+from math import sqrt
 
 # %%
 # torch.backends.cudnn.deterministic = True
 # torch.backends.cudnn.benchmark = False
+# %%
+import argparse
+
+parser = argparse.ArgumentParser()
+parser.add_argument('--embedding_dim', default=100, type=int)
+parser.add_argument('--dropout', default=0., type=float)
+
+# SciTail
+# parser.add_argument('--epochs', default=10, type=int)
+# parser.add_argument('--batch', default=128, type=int)
+# parser.add_argument('--dataset', default='SciTailV1.1')
+# parser.add_argument('--max_len', default=80)
+# parser.add_argument('--num_class', default=2)
+# parser.add_argument('--lr', default=1e-3)
+# parser.add_argument('--min_freq', default=2)
+
+# SNLI
+parser.add_argument('--epochs', default=7, type=int)
+parser.add_argument('--batch', default=128, type=int)
+parser.add_argument('--dataset', default='snli')
+parser.add_argument('--max_len', default=30)
+parser.add_argument('--num_class', default=3)
+parser.add_argument('--lr', default=1e-3)
+parser.add_argument('--min_freq', default=2)
+
+
+# Quora
+# parser.add_argument('--epochs', default=10, type=int)
+# parser.add_argument('--batch', default=128, type=int)
+# parser.add_argument('--dataset', default='quora')
+# parser.add_argument('--max_len', default=25)
+# parser.add_argument('--num_class', default=2)
+# parser.add_argument('--lr', default=1e-3)
+# parser.add_argument('--min_freq', default=15)
+
+args = parser.parse_known_args()
+print(args)
+
+# %%
+
 
 SEED = 1
 torch.manual_seed(SEED)
@@ -25,44 +69,26 @@ np.random.seed(SEED)
 random.seed(SEED)
 
 # %%
-MIN_FREQ = 2
+MIN_FREQ = args[0].min_freq
 tokenize = lambda x: x.split()
-EMBEDDING_DIM = 200
+EMBEDDING_DIM = args[0].embedding_dim
+DROPOUT = args[0].dropout
+GRAD_CLIP = 5
 PAD = 1
 UNK = 0
 device = torch.device('cuda')
 EPSILON = 1e-8
 INF = 1e13
 PAD_FIRST = False
-
-# N_EPOCH = 10
-# BATCH_SIZE = 32
-# MAX_LEN = 25
-# FIX_LEN = True
-# DATASET_NAME = 'quora'
-# NUM_CLASS = 2
-# KEEP = None
-# LR = 10e-4
-# MIN_FREQ = 15
-
-# N_EPOCH = 10
-# BATCH_SIZE = 128
-# MAX_LEN = 80
-# FIX_LEN = False
-# DATASET_NAME = 'SciTailV1.1'
-# NUM_CLASS = 2
-# KEEP = None
-# LR = 2e-4
-
-
-N_EPOCH = 10
-BATCH_SIZE = 32
-MAX_LEN = 30
-FIX_LEN = False
-DATASET_NAME = 'snli'
-NUM_CLASS = 3
 KEEP = None
-LR = 10e-4
+FIX_LEN = False
+
+N_EPOCH = args[0].epochs
+BATCH_SIZE = args[0].batch
+MAX_LEN = args[0].max_len
+DATASET_NAME = args[0].dataset
+NUM_CLASS = args[0].num_class
+LR = args[0].lr
 
 
 def read_train(fname):
@@ -178,7 +204,7 @@ print('Vocab length is {}'.format(VOCAB_LEN))
 print('Reading Embeddings...')
 w2v = gensim.models.KeyedVectors.load_word2vec_format(
     'embeddings/glove.6B.' + str(EMBEDDING_DIM)
-    + 'd.w2vformat.bin',
+    + 'd.txt.w2vformat',
     binary=True)
 
 embedding_weights = torch.zeros(VOCAB_LEN, EMBEDDING_DIM)
@@ -609,78 +635,91 @@ class SAN_light(nn.Module):
         return p
 
 
+class GeLU(nn.Module):
+    def forward(self, x):
+        return 0.5 * x * (1. + torch.tanh(x * 0.7978845608 * (1. + 0.044715 * x * x)))
+
+
 class RE2(nn.Module):
     class Block(nn.Module):
 
-        def __init__(self, dim_in, dim, n_inputs=2):
+        def __init__(self, dim_in, dim_hidden, dropout=0.):
             super().__init__()
             # self.conv = nn.Conv1d(in_channels=dim_in, out_channels=dim, kernel_size=3, padding=3 // 2)
-            self.convs = nn.Sequential(
-                nn.Conv1d(in_channels=dim_in, out_channels=dim, kernel_size=3, padding=3 // 2),
-                nn.ReLU(),
-                nn.Conv1d(in_channels=dim_in, out_channels=dim, kernel_size=3, padding=3 // 2),
+            self.convs = nn.ModuleList([
+                nn.Sequential(
+                    nn.Conv1d(in_channels=dim_in if i == 0 else dim_hidden, out_channels=dim_hidden, kernel_size=3,
+                              padding=3 // 2),
+                    GeLU(),
+                    nn.Dropout(dropout)
+                )
+                for i in range(3)])
+
+            dim_both = dim_hidden + dim_in
+
+            self.f = nn.Sequential(
+                nn.Linear(dim_both, dim_both),
+                GeLU()
             )
-            self.bilstm = nn.LSTM(dim_in, dim // 2, bidirectional=True)
-            dim_ = dim * n_inputs
-            self.f = nn.Linear(dim_, dim_)
-            self.g1 = nn.Linear(2 * dim_, dim_)
-            self.g2 = nn.Linear(2 * dim_, dim_)
-            self.g3 = nn.Linear(2 * dim_, dim_)
-            self.g = nn.Linear(3 * dim_, dim)
+            # self.temperature = 1 / sqrt(dim_hidden)
+            self.temperature = nn.Parameter(torch.tensor(1 / sqrt(dim_hidden)))
+
+            self.g1 = nn.Sequential(
+                nn.Linear(2 * dim_both, dim_hidden),
+                GeLU(),
+            )
+            self.g2 = nn.Sequential(
+                nn.Linear(2 * dim_both, dim_hidden),
+                GeLU(),
+            )
+            self.g3 = nn.Sequential(
+                nn.Linear(2 * dim_both, dim_hidden),
+                GeLU(),
+            )
+            self.g = nn.Sequential(
+                nn.Dropout(dropout),
+                nn.Linear(3 * dim_hidden, dim_hidden),
+                GeLU(),
+            )
 
         def encode(self, x, mask):
-            xx = F.relu(self.conv(x.transpose(1, 2)).transpose(1, 2))
-            xx = xx.masked_fill(mask.unsqueeze(-1), 0)
-            return xx
-
-        def encode2(self, x, mask):
-            xx = self.bilstm(x)[0]
-            xx = xx.masked_fill(mask.unsqueeze(-1), 0)
+            xx = x.transpose(1, 2)
+            for c in self.convs:
+                xx = c(xx)
+                xx = xx.masked_fill(mask.unsqueeze(-2), 0)
+            xx = xx.transpose(1, 2)
             return xx
 
         def align(self, xx1, xx2, mask1, mask2):
-            xx1_ = F.relu(self.f(xx1))
+            xx1_ = self.f(xx1)
             xx1_ = xx1_.masked_fill(mask1.unsqueeze(-1), 0)
 
-            xx2_ = F.relu(self.f(xx2))
+            xx2_ = self.f(xx2)
             xx2_ = xx2_.masked_fill(mask2.unsqueeze(-1), 0)
 
-            sims = torch.einsum('bme,bne->bmn', [xx1_, xx2_])
+            sims = torch.einsum('bme,bne->bmn', [xx1_, xx2_])  # * self.temperature
             mask = mask1.unsqueeze(2) | mask2.unsqueeze(1)
             sims = sims.masked_fill(mask, -INF)
 
             xx1_prim = torch.einsum('bne,bmn->bme', [xx2, sims.softmax(2)])
             xx2_prim = torch.einsum('bme,bmn->bne', [xx1, sims.softmax(1)])
 
-            ## FIXME mask?
-
             return xx1_prim, xx2_prim
 
         def fusion(self, xx, xx_prim, mask):
-            xx_bar1 = F.relu(self.g1(torch.cat([xx, xx_prim], -1)))
-            xx_bar2 = F.relu(self.g2(torch.cat([xx, xx - xx_prim], -1)))
-            xx_bar3 = F.relu(self.g3(torch.cat([xx, xx * xx_prim], -1)))
-            xx = F.relu(self.g(torch.cat([xx_bar1, xx_bar2, xx_bar3], -1)))
+            xx_bar1 = self.g1(torch.cat([xx, xx_prim], -1))
+            xx_bar2 = self.g2(torch.cat([xx, xx - xx_prim], -1))
+            xx_bar3 = self.g3(torch.cat([xx, xx * xx_prim], -1))
+            xx = self.g(torch.cat([xx_bar1, xx_bar2, xx_bar3], -1))
             xx = xx.masked_fill(mask.unsqueeze(-1), 0)
             return xx
 
-        def forward(self, ai, bi, mask_a, mask_b, ap=None, bp=None):
-            if ap is not None:
-                aa = torch.cat([ai, ap], -1)
-                bb = torch.cat([bi, bp], -1)
-            else:
-                aa = ai
-                bb = bi
+        def forward(self, a, b, mask_a, mask_b):
+            ae = self.encode(a, mask_a)
+            be = self.encode(b, mask_b)
 
-            ae = self.encode2(aa, mask_a)
-            be = self.encode2(bb, mask_b)
-
-            if ap is not None:
-                aa = torch.cat([ai, ae, ap], -1)
-                bb = torch.cat([bi, be, bp], -1)
-            else:
-                aa = torch.cat([ai, ae], -1)
-                bb = torch.cat([bi, be], -1)
+            aa = torch.cat([a, ae], -1)
+            bb = torch.cat([b, be], -1)
 
             aa_prim, bb_prim = self.align(aa, bb, mask_a, mask_b)
 
@@ -688,27 +727,19 @@ class RE2(nn.Module):
             bb = self.fusion(bb, bb_prim, mask_b)
             return aa, bb
 
-    def __init__(self):
+    def __init__(self, emb_dim=EMBEDDING_DIM, hidden_dim=EMBEDDING_DIM, dropout=0):
         super().__init__()
         self.emb = get_emb()
-        self.block1 = RE2.Block(EMBEDDING_DIM, EMBEDDING_DIM, n_inputs=2)
-        self.block2 = RE2.Block(2 * EMBEDDING_DIM, EMBEDDING_DIM, n_inputs=3)
-        self.block3 = RE2.Block(2 * EMBEDDING_DIM, EMBEDDING_DIM, n_inputs=3)
+        self.blocks = nn.ModuleList([
+            RE2.Block(emb_dim, hidden_dim, dropout=dropout),
+            RE2.Block(emb_dim + hidden_dim, hidden_dim, dropout=dropout),
+            RE2.Block(emb_dim + hidden_dim, hidden_dim, dropout=dropout)
+        ])
         self.h = nn.Sequential(
-            nn.Linear(4 * EMBEDDING_DIM, EMBEDDING_DIM),
+            nn.Linear(4 * hidden_dim, hidden_dim),
             nn.ReLU(),
-            nn.Linear(EMBEDDING_DIM, 1 if NUM_CLASS == 2 else NUM_CLASS)
+            nn.Linear(hidden_dim, 1 if NUM_CLASS == 2 else NUM_CLASS)
         )
-
-        # for p in self.block1.parameters():
-        #     if len(p.shape) > 1:
-        #         nn.init.kaiming_normal_(p)
-        # for p in self.block2.parameters():
-        #     if len(p.shape) > 1:
-        #         nn.init.kaiming_normal_(p)
-        # for p in self.block2.parameters():
-        #     if len(p.shape) > 1:
-        #         nn.init.kaiming_normal_(p)
 
     def forward(self, x1, x2):
         mask_a = x1 == PAD
@@ -717,14 +748,30 @@ class RE2(nn.Module):
         a_emb = self.emb(x1)
         b_emb = self.emb(x2)
 
-        a_out1, b_out1 = self.block1(a_emb, b_emb, mask_a, mask_b)
-        a_out2, b_out2 = self.block2(a_emb, b_emb, mask_a, mask_b, a_out1, b_out1)
-        a_out3, b_out3 = self.block3(a_emb, b_emb, mask_a, mask_b, a_out2 + a_out1, b_out2 + b_out1)
+        a = a_emb
+        b = b_emb
 
-        a_emb = a_out3.max(1)[0]
-        b_emb = b_out3.max(1)[0]
+        for i, block in enumerate(self.blocks):
+            if i == 0:
+                res_a, res_b = a, b
+            elif i == 1:
+                res_a, res_b = a, b
+                a = torch.cat([a, a_emb], -1)
+                b = torch.cat([b, b_emb], -1)
+            else:
+                res_a, res_b = a, b
+                a = torch.cat([(a + res_a) * sqrt(.5), a_emb], -1)
+                b = torch.cat([(b + res_b) * sqrt(.5), b_emb], -1)
+            a, b = block(a, b, mask_a, mask_b)
 
-        y_hat = self.h(torch.cat([a_emb, b_emb, a_emb - b_emb, a_emb * b_emb], -1)).squeeze(-1)
+
+        # a = a.masked_fill(mask_a.unsqueeze(-1), -INF)
+        # b = b.masked_fill(mask_b.unsqueeze(-1), -INF)
+
+        a = a.max(1)[0]
+        b = b.max(1)[0]
+
+        y_hat = self.h(torch.cat([a, b, a - b, a * b], -1)).squeeze(-1)
 
         return y_hat
 
@@ -878,7 +925,7 @@ class BiMPM(nn.Module):
         self.agg = nn.LSTM(perspective, perspective, bidirectional=True)
         self.agg2 = nn.LSTM(2 * EMBEDDING_DIM, 2 * EMBEDDING_DIM, bidirectional=True)
         self.final = nn.Sequential(
-            nn.Linear(4 * (4 * perspective + 4 * EMBEDDING_DIM), EMBEDDING_DIM),
+            nn.Linear(4 * EMBEDDING_DIM * 2 * 4, EMBEDDING_DIM),
             nn.ReLU(),
             nn.Linear(EMBEDDING_DIM, 1)
         )
@@ -1041,7 +1088,7 @@ class RNN(nn.Module):
         xx2 = self.rnn(xx2)[0][:, -1, :]
 
         m = torch.cat([xx1, xx2, xx1 - xx2, xx1 * xx2], -1)
-        y_hat = self.final(m)
+        y_hat = self.final(m).squeeze(-1)
 
         return y_hat
 
@@ -1066,8 +1113,152 @@ class DualTransformer(nn.Module):
         return y_hat
 
 
+class TEMP(nn.Module):
+    class HighwayMLP(nn.Module):
+        def __init__(self, dim):
+            super().__init__()
+            self.H = nn.Linear(dim, dim)
+            self.T = nn.Linear(dim, dim)
+
+        def forward(self, x):
+            t = self.T(x).sigmoid()
+            return self.H(x).relu() * t + x * (1 - t)
+
+    # class Factor(nn.Module):
+    #
+    #     def __init__(self, dim) -> None:
+    #         super().__init__()
+    #         self.linear = nn.Linear(dim, 1)
+    #         self.V = nn.Parameter(torch.zeros(dim, dim // 2))
+    #         nn.init.normal_(self.V)
+    #
+    #     def forward(self, xx):
+    #         a = self.linear(xx).squeeze(-1)
+    #         b = torch.triu(
+    #             ((self.V @ self.V.t()).unsqueeze(0).unsqueeze(0) + (xx.unsqueeze(-2) + xx.unsqueeze(-1)))
+    #         ).sum(-1).sum(-1)
+    #         return a + b
+
+    class Factor(nn.Module):
+        def __init__(self, dim):
+            super().__init__()
+            k = dim
+            # Initially we fill V with random values sampled from Gaussian distribution
+            # NB: use nn.Parameter to compute gradients
+            self.V = nn.Parameter(torch.randn(dim, k), requires_grad=True)
+            nn.init.kaiming_normal_(self.V)
+            self.lin = nn.Linear(dim, 1)
+
+        def forward(self, x):
+            out_1 = (x @ self.V).pow(2).sum(-1)  # S_1^2
+            out_2 = (x.pow(2) @ self.V.pow(2)).sum(-1)  # S_2
+
+            out_inter =  0.5 * (out_1 - out_2)
+            out_lin = self.lin(x).squeeze(-1)
+            out = out_inter + out_lin
+
+            return out
+
+    def __init__(self, dim=EMBEDDING_DIM) -> None:
+        super().__init__()
+        self.emb = get_emb()
+        self.highways = nn.Sequential(*[self.HighwayMLP(dim) for _ in range(1)])
+        self.F = nn.Linear(dim, dim)
+        self.G = nn.Linear(dim, dim)
+        self.Z = self.Factor(dim)
+        self.Z2 = self.Factor(dim * 2)
+        self.rnn_1 = nn.LSTM(dim, dim // 2, bidirectional=True, batch_first=True)
+        self.rnn_2 = nn.LSTM(dim + 6, dim, bidirectional=True, batch_first=True)
+        self.final = nn.Sequential(
+            nn.Linear(dim * 3 * 2 * 4, dim),
+            nn.ReLU(),
+            nn.Linear(dim, 1 if NUM_CLASS == 2 else NUM_CLASS)
+        )
+
+    def encode(self, xx):
+        xx = self.emb(xx)
+        xx = self.highways(xx)
+        return xx
+
+    def intra_align(self, xx, mask):
+        xx_f = self.G(xx).relu()
+        f = torch.einsum('bme,bne->bmn', [xx_f, xx_f])
+        mask_2d = mask.unsqueeze(-1) | mask.unsqueeze(-2) | torch.eye(xx.shape[1]).bool().to(device)
+        f = f.masked_fill(mask_2d, -INF)
+        xx_hat = torch.einsum('bne,bmn->bme', [xx, f.softmax(-1)])
+        return xx_hat
+
+    def forward(self, x1, x2):
+        c, r = x1, x2
+        c_mask = c == PAD
+        r_mask = r == PAD
+        mask_2d = c_mask.unsqueeze(-1) | r_mask.unsqueeze(-2)
+
+        c, r = self.emb(c), self.emb(r)
+        # c, r = self.highways(c), self.highways(r)
+        # c, r = self.rnn_1(c)[0], self.rnn_1(r)[0]
+
+        c = c.masked_fill(c_mask.unsqueeze(-1), 0)
+        r = r.masked_fill(r_mask.unsqueeze(-1), 0)
+
+        c_f, r_f = self.F(c).relu(), self.F(r).relu()
+        e = torch.einsum('bme,bne->bmn', [c_f, r_f])  # * (1/math.sqrt(EMBEDDING_DIM))
+        e = e.masked_fill(mask_2d, -INF)
+        c_hat = torch.einsum('bne,bmn->bme', [r, e.softmax(-1)])
+        r_hat = torch.einsum('bme,bmn->bne', [c, e.softmax(-2)])
+
+        c_intra = self.intra_align(c, c_mask)
+        r_intra = self.intra_align(r, r_mask)
+
+        c_hat = c_hat.masked_fill(c_mask.unsqueeze(-1), 0)
+        r_hat = r_hat.masked_fill(r_mask.unsqueeze(-1), 0)
+        c_intra = c_intra.masked_fill(c_mask.unsqueeze(-1), 0)
+        r_intra = r_intra.masked_fill(r_mask.unsqueeze(-1), 0)
+
+        # self.Z(torch.cat([c_hat, r_hat], -1))
+        factorizations_c = torch.stack([
+            self.Z2(torch.cat([c_hat, c], -1)),
+            self.Z(c_hat - c),
+            self.Z(c_hat * c),
+            self.Z2(torch.cat([c_intra, c], -1)),
+            self.Z(c_intra - c),
+            self.Z(c_intra * c),
+
+        ], -1)
+
+        factorizations_r = torch.stack([
+            self.Z2(torch.cat([r_hat, r], -1)),
+            self.Z(r_hat - r),
+            self.Z(r_hat * r),
+            self.Z2(torch.cat([r_intra, r], -1)),
+            self.Z(r_intra - r),
+            self.Z(r_intra * r),
+
+        ], -1)
+
+        c_x = torch.cat([c, factorizations_c], -1)
+        r_x = torch.cat([r, factorizations_r], -1)
+
+        c_x = c_x.masked_fill(c_mask.unsqueeze(-1), 0)
+        r_x = r_x.masked_fill(r_mask.unsqueeze(-1), 0)
+
+        c_x = self.rnn_2(c_x)[0]
+        r_x = self.rnn_2(r_x)[0]
+
+        # c_x = c_x.masked_fill(c_mask.unsqueeze(-1), 0)
+        # r_x = r_x.masked_fill(r_mask.unsqueeze(-1), 0)
+
+        c_p = torch.cat([c_x.max(1)[0], c_x.mean(1), c_x[:, -1, :]], -1)
+        r_p = torch.cat([r_x.max(1)[0], r_x.mean(1), r_x[:, -1, :]], -1)
+
+        penult = torch.cat([c_p, r_p, c_p - r_p, c_p * r_p], -1)
+        out = self.final(penult).squeeze(-1)
+
+        return out
+
+
 # %%
-model = RE2()
+# model = RE2(dropout=DROPOUT)
 # model = CustomREE()
 # model = RNN()
 # model = ESIM()
@@ -1078,10 +1269,15 @@ model = RE2()
 # model = SAN(T=5)
 # model = SAN_light()
 # model = ESIM_SAN()
+# model = CAFE()
+model = TEMP()
 
 model = model.to(device)
 
+print(type(model).__name__)
 
+
+# %%
 def calc_confusion_matrix(y, y_hat, num_classes=2):
     with torch.no_grad():
         if num_classes == 2:
@@ -1113,13 +1309,15 @@ optimizer = torch.optim.Adam(lr=LR, params=model.parameters())
 #     indices = torch.LongTensor([UNK]).to(device)
 #     model.emb.weight.grad[indices] = 0
 
+metrics_history = []
+dev_metrics_history = []
 
 for i_epoch in range(1, N_EPOCH + 1):
     model.train()
     loss_total = 0
     # accu_total = 0
     total = 0
-    train_metrics = np.zeros((NUM_CLASS, NUM_CLASS))
+    train_confusion_table = np.zeros((NUM_CLASS, NUM_CLASS))
 
     progress_bar = tqdm(train_data_loader)
     for batch in progress_bar:
@@ -1134,31 +1332,34 @@ for i_epoch in range(1, N_EPOCH + 1):
             loss = F.binary_cross_entropy_with_logits(y_hat, y.float(), reduction='sum')
         else:
             loss = F.cross_entropy(y_hat, y, reduction='sum')
-            
+
         # dont_update_unkown_words(model)
 
         loss.backward()
+        grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
+        assert grad_norm >= 0, 'encounter nan in gradients.'
         optimizer.step()
 
         loss_total += loss.item()
         total += y.shape[0]
-        train_metrics += calc_confusion_matrix(y, y_hat, NUM_CLASS)
+        train_confusion_table += calc_confusion_matrix(y, y_hat, NUM_CLASS)
 
         metrics = (
             loss_total / total,
-            *calc_metrics(train_metrics),
+            *calc_metrics(train_confusion_table),
         )
 
-        progress_bar.set_description(Fore.RESET + '[ EP {0:02d} ]'
-        # '[ TRN LS: {1:.4f} PR: {2:.4f} F1: {4:.4f} AC: {5:.4f}]'
-                                                  '[ TRN LS: {1:.4f} AC: {5:.4f} ]'
-                                     .format(i_epoch, *metrics))
+        progress_bar.set_description(
+            Fore.RESET +
+            '[ EP {0:02d} ]'
+            # '[ TRN LS: {1:.4f} PR: {2:.4f} F1: {4:.4f} AC: {5:.4f}]'
+            '[ LS: {1:.4f} AC: {5:.4f} TRN ]'
+            .format(i_epoch, *metrics))
 
     model.eval()
-
     loss_total_dev = 0
     total_dev = 0
-    dev_metrics = np.zeros((NUM_CLASS, NUM_CLASS))
+    dev_confusion_table = np.zeros((NUM_CLASS, NUM_CLASS))
 
     with torch.no_grad():
         progress_bar = tqdm(dev_data_loader)
@@ -1174,17 +1375,21 @@ for i_epoch in range(1, N_EPOCH + 1):
 
             loss_total_dev += loss.item()
             total_dev += y.shape[0]
-            dev_metrics += calc_confusion_matrix(y, y_hat, NUM_CLASS)
+            dev_confusion_table += calc_confusion_matrix(y, y_hat, NUM_CLASS)
 
-            metrics = (
+            metrics_dev = (
                 loss_total_dev / total_dev,
-                *calc_metrics(dev_metrics)
+                *calc_metrics(dev_confusion_table)
             )
 
-            progress_bar.set_description(Fore.BLUE + '[ EP {0:02d} ]'
-            # '[ TST LS: {1:.4f} PR: {2:.4f} F1: {4:.4f} AC: {5:.4f} ]'
-                                                     '[ DEV LS: {1:.4f} AC: {5:.4f} ]'
-                                         .format(i_epoch, *metrics))
+            progress_bar.set_description(
+                Fore.GREEN +
+                '[ EP {0:02d} ]'
+                # '[ TST LS: {1:.4f} PR: {2:.4f} F1: {4:.4f} AC: {5:.4f} ]'
+                '[ LS: {1:.4f} AC: {5:.4f} DEV ]'
+                .format(i_epoch, *metrics_dev))
+
+    metrics_history.append((*metrics, *metrics_dev))
 
     # model.eval()
     #
@@ -1231,3 +1436,75 @@ for i_epoch in range(1, N_EPOCH + 1):
     #                              # '[ TST LS: {5:.4f} PR: {6:.4f} F1: {7:.4f} AC: {8:.4f} ]'
     #                              '[ TST LS: {6:.4f} AC: {10:.4f} ]'
     #                              .format(i_epoch, *metrics))
+
+# %%
+hyper_parameters = '--'.join([k + '=' + str(v) for k, v in vars(args[0]).items() if k != DATASET_NAME])
+
+if os.path.exists('histories/' + DATASET_NAME):
+    with open('histories/' + DATASET_NAME, 'rb') as f:
+        baselines = pickle.load(f)
+else:
+    baselines = dict()
+
+
+def model_name(model):
+    try:
+        a = model.name
+    except:
+        a = type(model).__name__
+    return a
+
+
+baselines[model_name(model)] = metrics_history
+
+metrics_history_all_t = [np.array(i).T for i in baselines.values()]
+model_names = list(baselines.keys())
+
+rows = []
+dev_acc_index = -1
+for name, values in zip(model_names, metrics_history_all_t):
+    best_index = values[dev_acc_index].argmax()
+    row = [name, *values[:, best_index].tolist(), best_index]
+    row = row[:2] + row[5:7] + row[10:]
+    rows.append(row)
+
+rows = sorted(rows, key=lambda x: x[-2])
+t = Texttable()
+t.add_rows(rows, header=False)
+t.header(('Model', 'Train Loss', 'Train Acc', 'Dev Loss', 'Dev Acc', 'Epoch'))
+print(t.draw())
+
+# %%
+with open('metrics/' + DATASET_NAME + '.txt', 'w') as f:
+    print(t.draw(), file=f)
+
+# %%
+with open('histories/' + DATASET_NAME, 'wb') as f:
+    pickle.dump(baselines, f)
+
+# %%
+from matplotlib import pyplot as plt
+import seaborn as sns
+
+sns.set()
+plt.clf()
+ax = plt.gca()
+for history in metrics_history_all_t:
+    color = next(ax._get_lines.prop_cycler)['color']
+    plt.plot(history[dev_acc_index], color=color, marker='o')
+    # plt.plot(history[3], '--', color=color)
+
+# plt.yticks([i / 10 for i in range(11)])
+plt.ylabel('Acc')
+plt.xlabel('Epoch')
+
+legends = []
+for i in model_names:
+    legends.append(i)
+
+plt.legend(legends, loc='upper left',
+           bbox_to_anchor=(0, -0.2),
+           fancybox=True, shadow=True, ncol=2)
+plt.title("Comparison of ANN Models for " + DATASET_NAME)
+# plt.show()
+plt.savefig('plots/' + DATASET_NAME + '.png', dpi=300, bbox_inches='tight')
