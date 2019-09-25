@@ -27,29 +27,30 @@ import argparse
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--embedding_dim', default=100, type=int)
+parser.add_argument('--embedding_version', default='6B')
 parser.add_argument('--dropout', default=0., type=float)
 
 # SciTail
-# parser.add_argument('--epochs', default=10, type=int)
-# parser.add_argument('--batch', default=128, type=int)
-# parser.add_argument('--dataset', default='SciTailV1.1')
-# parser.add_argument('--max_len', default=80)
-# parser.add_argument('--num_class', default=2)
-# parser.add_argument('--lr', default=1e-3)
-# parser.add_argument('--min_freq', default=2)
-
-# SNLI
-parser.add_argument('--epochs', default=7, type=int)
+parser.add_argument('--epochs', default=10, type=int)
 parser.add_argument('--batch', default=128, type=int)
-parser.add_argument('--dataset', default='snli')
-parser.add_argument('--max_len', default=30)
-parser.add_argument('--num_class', default=3)
+parser.add_argument('--dataset', default='SciTailV1.1')
+parser.add_argument('--max_len', default=80)
+parser.add_argument('--num_class', default=2)
 parser.add_argument('--lr', default=1e-3)
 parser.add_argument('--min_freq', default=2)
 
+# SNLI
+# parser.add_argument('--epochs', default=7, type=int)
+# parser.add_argument('--batch', default=128, type=int)
+# parser.add_argument('--dataset', default='snli')
+# parser.add_argument('--max_len', default=30)
+# parser.add_argument('--num_class', default=3)
+# parser.add_argument('--lr', default=1e-3)
+# parser.add_argument('--min_freq', default=2)
+
 
 # Quora
-# parser.add_argument('--epochs', default=10, type=int)
+# parser.add_argument('--epochs', default=5, type=int)
 # parser.add_argument('--batch', default=128, type=int)
 # parser.add_argument('--dataset', default='quora')
 # parser.add_argument('--max_len', default=25)
@@ -203,8 +204,8 @@ print('Vocab length is {}'.format(VOCAB_LEN))
 # %%
 print('Reading Embeddings...')
 w2v = gensim.models.KeyedVectors.load_word2vec_format(
-    'embeddings/glove.6B.' + str(EMBEDDING_DIM)
-    + 'd.txt.w2vformat',
+    'embeddings/glove.' + args[0].embedding_version + '.' + str(EMBEDDING_DIM)
+    + 'd.w2vformat.bin',
     binary=True)
 
 embedding_weights = torch.zeros(VOCAB_LEN, EMBEDDING_DIM)
@@ -310,7 +311,7 @@ class ESIM(nn.Module):
         self.RNN_1 = nn.LSTM(emb_dim, hidden_dim, batch_first=True, bidirectional=True)
         self.RNN_2 = nn.LSTM(hidden_dim * 2 * 4, hidden_dim, batch_first=True, bidirectional=True)
         self.final = nn.Sequential(
-            nn.Linear(2 * 2 * 4 * hidden_dim, hidden_dim),
+            nn.Linear(2 * 1 * 4 * hidden_dim, hidden_dim),
             nn.ReLU(),
             nn.Linear(hidden_dim, 1 if num_class == 2 else num_class),
         )
@@ -347,11 +348,12 @@ class ESIM(nn.Module):
 
         # v = torch.cat([c_v[:, -1, :], r_v[:, -1, :], c_v.max(1)[0], r_v.max(1)[0],
         #                ], -1)
-        c_v = c_v.masked_fill(c_mask.unsqueeze(-1), 0)
-        r_v = r_v.masked_fill(r_mask.unsqueeze(-1), 0)
+        c_v = c_v.masked_fill(c_mask.unsqueeze(-1), -INF)
+        r_v = r_v.masked_fill(r_mask.unsqueeze(-1), -INF)
 
-        vc = torch.cat([c_v[:, -1, :], c_v.max(1)[0]], -1)
-        vr = torch.cat([r_v[:, -1, :], r_v.max(1)[0]], -1)
+
+        vc = torch.cat([c_v.max(1)[0]], -1)
+        vr = torch.cat([r_v.max(1)[0]], -1)
         v = torch.cat([vc, vr, vc - vr, vc * vr], -1)
 
         p = self.final(v).squeeze(-1)
@@ -1075,17 +1077,35 @@ class FlatSMN(nn.Module):
 
 class RNN(nn.Module):
 
-    def __init__(self):
+    def __init__(self, dim=EMBEDDING_DIM, hidden_dim=200):
         super().__init__()
         self.emb = get_emb()
-        self.rnn = nn.LSTM(EMBEDDING_DIM, 200, batch_first=True, bidirectional=True)
-        self.final = nn.Linear(400 * 4, 1 if NUM_CLASS == 2 else NUM_CLASS)
+        self.rnn = nn.LSTM(dim, hidden_dim, batch_first=True, bidirectional=True)
+        self.final = nn.Linear(hidden_dim * 2 * 2 * 4, 1 if NUM_CLASS == 2 else NUM_CLASS)
 
     def forward(self, x1, x2):
+        x1_mask = x1 == PAD
+        x2_mask = x2 == PAD
+
         xx1 = self.emb(x1)
         xx2 = self.emb(x2)
-        xx1 = self.rnn(xx1)[0][:, -1, :]
-        xx2 = self.rnn(xx2)[0][:, -1, :]
+        xx1 = self.rnn(xx1)[0]
+        xx2 = self.rnn(xx2)[0]
+
+        xx1 = xx1.masked_fill(x1_mask.unsqueeze(-1), -INF)
+        xx2 = xx2.masked_fill(x2_mask.unsqueeze(-1), -INF)
+
+        xx1_max = xx1.max(1)[0]
+        xx2_max = xx2.max(1)[0]
+
+        xx1 = xx1.masked_fill(x1_mask.unsqueeze(-1), 0)
+        xx2 = xx2.masked_fill(x2_mask.unsqueeze(-1), 0)
+
+        xx1_mean = xx1.sum(1) / (~x1_mask).long().sum(1, keepdim=True).float()
+        xx2_mean = xx2.sum(1) / (~x2_mask).long().sum(1, keepdim=True).float()
+
+        xx1 = torch.cat([xx1_max, xx1_mean], -1)
+        xx2 = torch.cat([xx2_max, xx2_mean], -1)
 
         m = torch.cat([xx1, xx2, xx1 - xx2, xx1 * xx2], -1)
         y_hat = self.final(m).squeeze(-1)
@@ -1113,7 +1133,7 @@ class DualTransformer(nn.Module):
         return y_hat
 
 
-class TEMP(nn.Module):
+class CAFE(nn.Module):
     class HighwayMLP(nn.Module):
         def __init__(self, dim):
             super().__init__()
@@ -1140,8 +1160,9 @@ class TEMP(nn.Module):
     #         return a + b
 
     class Factor(nn.Module):
-        def __init__(self, dim):
+        def __init__(self, dim, only_linear=False):
             super().__init__()
+            self.only_linear = only_linear
             k = dim
             # Initially we fill V with random values sampled from Gaussian distribution
             # NB: use nn.Parameter to compute gradients
@@ -1150,10 +1171,12 @@ class TEMP(nn.Module):
             self.lin = nn.Linear(dim, 1)
 
         def forward(self, x):
-            out_1 = (x @ self.V).pow(2).sum(-1)  # S_1^2
-            out_2 = (x.pow(2) @ self.V.pow(2)).sum(-1)  # S_2
-
-            out_inter =  0.5 * (out_1 - out_2)
+            if not self.only_linear:
+                out_1 = (x @ self.V).pow(2).sum(-1)  # S_1^2
+                out_2 = (x.pow(2) @ self.V.pow(2)).sum(-1)  # S_2
+                out_inter =  0.5 * (out_1 - out_2)
+            else:
+               out_inter = 0
             out_lin = self.lin(x).squeeze(-1)
             out = out_inter + out_lin
 
@@ -1170,7 +1193,7 @@ class TEMP(nn.Module):
         self.rnn_1 = nn.LSTM(dim, dim // 2, bidirectional=True, batch_first=True)
         self.rnn_2 = nn.LSTM(dim + 6, dim, bidirectional=True, batch_first=True)
         self.final = nn.Sequential(
-            nn.Linear(dim * 3 * 2 * 4, dim),
+            nn.Linear(dim * 2 * 2 * 4, dim),
             nn.ReLU(),
             nn.Linear(dim, 1 if NUM_CLASS == 2 else NUM_CLASS)
         )
@@ -1245,11 +1268,20 @@ class TEMP(nn.Module):
         c_x = self.rnn_2(c_x)[0]
         r_x = self.rnn_2(r_x)[0]
 
-        # c_x = c_x.masked_fill(c_mask.unsqueeze(-1), 0)
-        # r_x = r_x.masked_fill(r_mask.unsqueeze(-1), 0)
+        c_x = c_x.masked_fill(c_mask.unsqueeze(-1), -INF)
+        r_x = r_x.masked_fill(r_mask.unsqueeze(-1), -INF)
 
-        c_p = torch.cat([c_x.max(1)[0], c_x.mean(1), c_x[:, -1, :]], -1)
-        r_p = torch.cat([r_x.max(1)[0], r_x.mean(1), r_x[:, -1, :]], -1)
+        c_x_max = c_x.max(1)[0]
+        r_x_max = r_x.max(1)[0]
+
+        c_x = c_x.masked_fill(c_mask.unsqueeze(-1), 0)
+        r_x = r_x.masked_fill(r_mask.unsqueeze(-1), 0)
+
+        c_x_mean = c_x.sum(1) / (~c_mask).sum(1, keepdim=True).float()
+        r_x_mean = r_x.sum(1) / (~r_mask).sum(1, keepdim=True).float()
+
+        c_p = torch.cat([c_x_max, c_x_mean], -1)
+        r_p = torch.cat([r_x_max, r_x_mean], -1)
 
         penult = torch.cat([c_p, r_p, c_p - r_p, c_p * r_p], -1)
         out = self.final(penult).squeeze(-1)
@@ -1270,7 +1302,7 @@ class TEMP(nn.Module):
 # model = SAN_light()
 # model = ESIM_SAN()
 # model = CAFE()
-model = TEMP()
+# model = TEMP()
 
 model = model.to(device)
 
@@ -1438,10 +1470,10 @@ for i_epoch in range(1, N_EPOCH + 1):
     #                              .format(i_epoch, *metrics))
 
 # %%
-hyper_parameters = '--'.join([k + '=' + str(v) for k, v in vars(args[0]).items() if k != DATASET_NAME])
-
-if os.path.exists('histories/' + DATASET_NAME):
-    with open('histories/' + DATASET_NAME, 'rb') as f:
+hyper_parameters = '--'.join([k + '=' + str(v) for k, v in vars(args[0]).items() if k in ['embedding_dim', 'batch', 'dropout']])
+history_dir = 'histories/' + hyper_parameters
+if os.path.exists(history_dir + '/' + DATASET_NAME):
+    with open(history_dir + '/' + DATASET_NAME, 'rb') as f:
         baselines = pickle.load(f)
 else:
     baselines = dict()
@@ -1475,11 +1507,17 @@ t.header(('Model', 'Train Loss', 'Train Acc', 'Dev Loss', 'Dev Acc', 'Epoch'))
 print(t.draw())
 
 # %%
-with open('metrics/' + DATASET_NAME + '.txt', 'w') as f:
+metrics_dir = 'metrics/' + hyper_parameters
+if not os.path.exists(metrics_dir):
+    os.mkdir(metrics_dir)
+with open(metrics_dir + '/' + DATASET_NAME + '.txt', 'w') as f:
     print(t.draw(), file=f)
 
 # %%
-with open('histories/' + DATASET_NAME, 'wb') as f:
+
+if not os.path.exists(history_dir):
+    os.mkdir(history_dir)
+with open(history_dir + '/' + DATASET_NAME, 'wb') as f:
     pickle.dump(baselines, f)
 
 # %%
@@ -1491,7 +1529,7 @@ plt.clf()
 ax = plt.gca()
 for history in metrics_history_all_t:
     color = next(ax._get_lines.prop_cycler)['color']
-    plt.plot(history[dev_acc_index], color=color, marker='o')
+    plt.plot(range(1, len(history[dev_acc_index]) + 1), history[dev_acc_index], color=color, marker='o')
     # plt.plot(history[3], '--', color=color)
 
 # plt.yticks([i / 10 for i in range(11)])
@@ -1507,4 +1545,7 @@ plt.legend(legends, loc='upper left',
            fancybox=True, shadow=True, ncol=2)
 plt.title("Comparison of ANN Models for " + DATASET_NAME)
 # plt.show()
-plt.savefig('plots/' + DATASET_NAME + '.png', dpi=300, bbox_inches='tight')
+plot_dir = 'plots/' + hyper_parameters
+if not os.path.exists(plot_dir):
+    os.mkdir(plot_dir)
+plt.savefig(plot_dir + '/' + DATASET_NAME + '.png', dpi=400, bbox_inches='tight')
