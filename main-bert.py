@@ -79,7 +79,7 @@ def f(x):
 def read_data(fname):
     df = pd.read_csv(fname)
 
-    df['text'] = df.apply(lambda row: '[CLS] ' + row[0] + ' [SEP] ' + row[1] + ' [SEP]', axis=1)
+    df['text'] = df.apply(lambda row: '[CLS] ' + row[0] + ' ' + row[1] + ' [SEP]', axis=1)
 
     if os.name == 'nt':  # Because windows is a piece of shit that cant even fork processes
         token_ids = list(map(f, df.text))
@@ -110,45 +110,45 @@ test_data_loader = read_data(DATASET_NAME + '/test.csv')
 
 # %%
 
-# model = DistilBertForSequenceClassification.from_pretrained(
-#     "distilbert-base-uncased", num_labels=NUM_CLASS, output_hidden_states=True)
-# # model = BertForSequenceClassification.from_pretrained(
-# #     "bert-base-uncased", num_labels=NUM_CLASS)
-# model = model.to(device)
+model = DistilBertForSequenceClassification.from_pretrained(
+    "distilbert-base-uncased", num_labels=NUM_CLASS)#, output_hidden_states=True)
+# model = BertForSequenceClassification.from_pretrained(
+#     "bert-base-uncased", num_labels=NUM_CLASS)
+model = model.to(device)
 
 #%%
-class CustomBert(nn.Module):
-    class ESIM(nn.Module):
-
-        def __init__(self) -> None:
-            super().__init__()
-            self.rnn = nn.LSTM()
-
-    def __init__(self) -> None:
-        super().__init__()
-        self.bert_model = DistilBertModel.from_pretrained("distilbert-base-uncased", output_hidden_states=True)
-
-        self.final = nn.Sequential(
-            nn.Linear(768 * 4, 768),
-            nn.ReLU(),
-            nn.Linear(768, NUM_CLASS)
-        )
-
-
-    def forward(self, x, att_mask):
-        _, hiddens = self.bert_model(x, attention_mask=att_mask)
-
-        a = hiddens[-1]
-        a_hat = hiddens[-2]
-
-
-
-        o = self.final(m).squeeze()
-
-        return o
-
-model = CustomBert()
-model = model.to(device)
+# class CustomBert(nn.Module):
+#     class ESIM(nn.Module):
+#
+#         def __init__(self) -> None:
+#             super().__init__()
+#             self.rnn = nn.LSTM()
+#
+#     def __init__(self) -> None:
+#         super().__init__()
+#         self.bert_model = DistilBertModel.from_pretrained("distilbert-base-uncased", output_hidden_states=True)
+#
+#         self.final = nn.Sequential(
+#             nn.Linear(768 * 4, 768),
+#             nn.ReLU(),
+#             nn.Linear(768, NUM_CLASS)
+#         )
+#
+#
+#     def forward(self, x, att_mask):
+#         _, hiddens = self.bert_model(x, attention_mask=att_mask)
+#
+#         a = hiddens[-1]
+#         a_hat = hiddens[-2]
+#
+#
+#
+#         o = self.final(m).squeeze()
+#
+#         return o
+#
+# model = CustomBert()
+# model = model.to(device)
 
 # %%
 param_optimizer = list(model.named_parameters())
@@ -164,7 +164,7 @@ optimizer_grouped_parameters = [
 optimizer = AdamW(model.parameters(), lr=2e-5)
 
 # %%
-train_loss_set = []
+# train_loss_set = []
 
 # Number of training epochs (authors recommend between 2 and 4)
 epochs = 4
@@ -173,17 +173,11 @@ criterion = nn.CrossEntropyLoss()
 
 # trange is a tqdm wrapper around the normal python range
 for ep in range(epochs):
-    #   print('EPOCH', ep)
-
-    # Training
-
-    # Set our model to training mode (as opposed to evaluation mode)
     model.train()
 
-    # Tracking variables
-    tr_loss = 0
-    acc = 0
-    nb_tr_examples, nb_tr_steps = 0, 0
+    loss_train = 0
+    acc_train = 0
+    total_train, nb_tr_steps = 0, 0
 
     # Train the data for one epoch
     p_bar = tqdm(train_data_loader)
@@ -196,23 +190,23 @@ for ep in range(epochs):
         optimizer.zero_grad()
         # Forward pass
         attn_mask = ~b_input_ids.eq(PAD)
-        logits = model(b_input_ids, attn_mask)
+        loss, logits = model(b_input_ids, attn_mask, labels=b_labels)
 
-        loss = criterion(logits, b_labels)
+        # loss = criterion(logits, b_labels)
 
-        acc += logits.argmax(1).eq(b_labels).long().sum().item()
-        train_loss_set.append(loss.item())
+        acc_train += logits.argmax(1).eq(b_labels).long().sum().item()
+        # train_loss_set.append(loss.item())
         # Backward pass
         loss.backward()
         # Update parameters and take a step using the computed gradient
         optimizer.step()
 
         # Update tracking variables
-        tr_loss += loss.item()
-        nb_tr_examples += b_input_ids.size(0)
+        loss_train += loss.item()
+        total_train += b_input_ids.size(0)
         nb_tr_steps += 1
 
-        p_bar.set_description('Loss {:.4f} Acc {:.4f}'.format(tr_loss / nb_tr_steps, acc / nb_tr_examples))
+        p_bar.set_description('Loss {:.4f} Acc {:.4f}'.format(loss_train / nb_tr_steps, acc_train / total_train))
 
     # print("Train loss: {}".format(tr_loss / nb_tr_steps))
 
@@ -226,7 +220,7 @@ for ep in range(epochs):
 
         # Tracking variables
         ts_loss = 0
-        acc = 0
+        acc_train = 0
         nb_ts_examples, nb_ts_steps = 0, 0
 
         # test the data for one epoch
@@ -241,13 +235,13 @@ for ep in range(epochs):
             attn_mask = ~b_input_ids.eq(PAD)
             loss, logits = model(b_input_ids, attention_mask=attn_mask, labels=b_labels)
 
-            acc += logits.argmax(1).eq(b_labels).long().sum().item()
+            acc_train += logits.argmax(1).eq(b_labels).long().sum().item()
 
             # Update tracking variables
             ts_loss += loss.item()
             nb_ts_examples += b_input_ids.size(0)
             nb_ts_steps += 1
 
-            p_bar.set_description('Loss {:.4f} Acc {:.4f}'.format(ts_loss / nb_ts_steps, acc / nb_ts_examples))
+            p_bar.set_description('Loss {:.4f} Acc {:.4f}'.format(ts_loss / nb_ts_steps, acc_train / nb_ts_examples))
 
         # print("test loss: {}".format(ts_loss / nb_ts_steps))

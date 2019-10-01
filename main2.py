@@ -31,26 +31,26 @@ parser.add_argument('--embedding_version', default='6B')
 parser.add_argument('--dropout', default=0., type=float)
 
 # SciTail
-parser.add_argument('--epochs', default=10, type=int)
-parser.add_argument('--batch', default=128, type=int)
-parser.add_argument('--dataset', default='SciTailV1.1')
-parser.add_argument('--max_len', default=80)
-parser.add_argument('--num_class', default=2)
-parser.add_argument('--lr', default=1e-3)
-parser.add_argument('--min_freq', default=2)
-
-# SNLI
-# parser.add_argument('--epochs', default=7, type=int)
+# parser.add_argument('--epochs', default=10, type=int)
 # parser.add_argument('--batch', default=128, type=int)
-# parser.add_argument('--dataset', default='snli')
-# parser.add_argument('--max_len', default=30)
-# parser.add_argument('--num_class', default=3)
+# parser.add_argument('--dataset', default='SciTailV1.1')
+# parser.add_argument('--max_len', default=80)
+# parser.add_argument('--num_class', default=2)
 # parser.add_argument('--lr', default=1e-3)
 # parser.add_argument('--min_freq', default=2)
 
+# SNLI
+parser.add_argument('--epochs', default=7, type=int)
+parser.add_argument('--batch', default=128, type=int)
+parser.add_argument('--dataset', default='snli')
+parser.add_argument('--max_len', default=30)
+parser.add_argument('--num_class', default=3)
+parser.add_argument('--lr', default=1e-3)
+parser.add_argument('--min_freq', default=2)
+
 
 # Quora
-# parser.add_argument('--epochs', default=5, type=int)
+# parser.add_argument('--epochs', default=12, type=int)
 # parser.add_argument('--batch', default=128, type=int)
 # parser.add_argument('--dataset', default='quora')
 # parser.add_argument('--max_len', default=25)
@@ -303,15 +303,15 @@ class DiSAN(nn.Module):
         return y_hat
 
 
-class ESIM(nn.Module):
+class ESIM_(nn.Module):
 
     def __init__(self, emb_dim=EMBEDDING_DIM, hidden_dim=EMBEDDING_DIM, num_class=NUM_CLASS):
         super().__init__()
         self.emb = get_emb()
         self.RNN_1 = nn.LSTM(emb_dim, hidden_dim, batch_first=True, bidirectional=True)
-        self.RNN_2 = nn.LSTM(hidden_dim * 2 * 4, hidden_dim, batch_first=True, bidirectional=True)
+        self.RNN_2 = nn.LSTM(hidden_dim * 2 * 5, hidden_dim, batch_first=True, bidirectional=True)
         self.final = nn.Sequential(
-            nn.Linear(2 * 1 * 4 * hidden_dim, hidden_dim),
+            nn.Linear(2 * 2 * 5 * hidden_dim, hidden_dim),
             nn.ReLU(),
             nn.Linear(hidden_dim, 1 if num_class == 2 else num_class),
         )
@@ -337,8 +337,8 @@ class ESIM(nn.Module):
         r_att_scores = att.softmax(1)  # BMN
         r_hat = torch.einsum('bmn,bmh->bnh', [r_att_scores, cs])
 
-        c_m = torch.cat([cs, c_hat, cs - c_hat, cs * c_hat], -1)  # BL(8H)
-        r_m = torch.cat([rs, r_hat, rs - r_hat, rs * r_hat], -1)
+        c_m = torch.cat([cs, c_hat, cs - c_hat, cs * c_hat, (cs - c_hat) * (c_hat - cs)], -1)  # BL(8H)
+        r_m = torch.cat([rs, r_hat, rs - r_hat, rs * r_hat, (rs - r_hat) * (r_hat - rs)], -1)
 
         c_m = c_m.masked_fill(c_mask.unsqueeze(-1), 0)
         r_m = r_m.masked_fill(r_mask.unsqueeze(-1), 0)
@@ -346,15 +346,21 @@ class ESIM(nn.Module):
         c_v, _ = self.RNN_2(c_m)  # BL(16H)
         r_v, _ = self.RNN_2(r_m)
 
-        # v = torch.cat([c_v[:, -1, :], r_v[:, -1, :], c_v.max(1)[0], r_v.max(1)[0],
-        #                ], -1)
         c_v = c_v.masked_fill(c_mask.unsqueeze(-1), -INF)
         r_v = r_v.masked_fill(r_mask.unsqueeze(-1), -INF)
 
+        c_v_max = c_v.max(1)[0]
+        r_v_max = r_v.max(1)[0]
 
-        vc = torch.cat([c_v.max(1)[0]], -1)
-        vr = torch.cat([r_v.max(1)[0]], -1)
-        v = torch.cat([vc, vr, vc - vr, vc * vr], -1)
+        c_v = c_v.masked_fill(c_mask.unsqueeze(-1), 0)
+        r_v = r_v.masked_fill(r_mask.unsqueeze(-1), 0)
+
+        c_v_mean = c_v.sum(1) / (~c_mask).sum(1, keepdim=True).float()
+        r_v_mean = r_v.sum(1) / (~r_mask).sum(1, keepdim=True).float()
+
+        vc = torch.cat([c_v_max, c_v_mean], -1)
+        vr = torch.cat([r_v_max, r_v_mean], -1)
+        v = torch.cat([vc, vr, vc - vr, vc * vr, (vc - vr) * (vr - vc)], -1)
 
         p = self.final(v).squeeze(-1)
 
@@ -1077,11 +1083,11 @@ class FlatSMN(nn.Module):
 
 class RNN(nn.Module):
 
-    def __init__(self, dim=EMBEDDING_DIM, hidden_dim=200):
+    def __init__(self, dim=100, hidden_dim=200):
         super().__init__()
         self.emb = get_emb()
         self.rnn = nn.LSTM(dim, hidden_dim, batch_first=True, bidirectional=True)
-        self.final = nn.Linear(hidden_dim * 2 * 2 * 4, 1 if NUM_CLASS == 2 else NUM_CLASS)
+        self.final = nn.Linear(hidden_dim * 2 * 2 * 5, 1 if NUM_CLASS == 2 else NUM_CLASS)
 
     def forward(self, x1, x2):
         x1_mask = x1 == PAD
@@ -1107,7 +1113,7 @@ class RNN(nn.Module):
         xx1 = torch.cat([xx1_max, xx1_mean], -1)
         xx2 = torch.cat([xx2_max, xx2_mean], -1)
 
-        m = torch.cat([xx1, xx2, xx1 - xx2, xx1 * xx2], -1)
+        m = torch.cat([xx1, xx2, xx1 - xx2, xx1 * xx2, (xx1 - xx2) * (xx2 - xx1)], -1)
         y_hat = self.final(m).squeeze(-1)
 
         return y_hat
@@ -1190,10 +1196,10 @@ class CAFE(nn.Module):
         self.G = nn.Linear(dim, dim)
         self.Z = self.Factor(dim)
         self.Z2 = self.Factor(dim * 2)
-        self.rnn_1 = nn.LSTM(dim, dim // 2, bidirectional=True, batch_first=True)
+        self.rnn_1 = nn.LSTM(dim, dim , bidirectional=False, batch_first=True)
         self.rnn_2 = nn.LSTM(dim + 6, dim, bidirectional=True, batch_first=True)
         self.final = nn.Sequential(
-            nn.Linear(dim * 2 * 2 * 4, dim),
+            nn.Linear(dim * 2 * 2 * 5, dim),
             nn.ReLU(),
             nn.Linear(dim, 1 if NUM_CLASS == 2 else NUM_CLASS)
         )
@@ -1283,7 +1289,7 @@ class CAFE(nn.Module):
         c_p = torch.cat([c_x_max, c_x_mean], -1)
         r_p = torch.cat([r_x_max, r_x_mean], -1)
 
-        penult = torch.cat([c_p, r_p, c_p - r_p, c_p * r_p], -1)
+        penult = torch.cat([c_p, r_p, c_p - r_p, c_p * r_p, (c_p - r_p) * (r_p - c_p)], -1)
         out = self.final(penult).squeeze(-1)
 
         return out
@@ -1293,7 +1299,7 @@ class CAFE(nn.Module):
 # model = RE2(dropout=DROPOUT)
 # model = CustomREE()
 # model = RNN()
-# model = ESIM()
+model = ESIM_()
 # model = CompAgg()
 # model = DiSAN()
 # model = BiMPM()
