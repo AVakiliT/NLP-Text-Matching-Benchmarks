@@ -12,7 +12,7 @@ from nltk import word_tokenize
 from sklearn.metrics import confusion_matrix
 from torch.utils.data import Dataset, DataLoader, Sampler
 from torch import nn
-from torch.nn import functional as F, init
+from torch.nn import functional as F, init, DataParallel
 from tqdm import tqdm
 
 # %%
@@ -30,7 +30,7 @@ tokenize = lambda x: x.split()
 EMBEDDING_DIM = 200
 PAD = 1
 UNK = 0
-device = torch.device('cuda')
+device = torch.device('cuda:0')
 EPSILON = 1e-8
 INF = 1e13
 PAD_FIRST = False
@@ -56,7 +56,7 @@ PAD_FIRST = False
 
 
 N_EPOCH = 10
-BATCH_SIZE = 32
+BATCH_SIZE = 512
 MAX_LEN = 45
 FIX_LEN = False
 DATASET_NAME = 'snli'
@@ -266,15 +266,17 @@ class BiLSTM(nn.Module):
     def forward(self, x):
         mask = x == PAD
         xx = self.emb(x)
+        self.RNN1.flatten_parameters()
         xh = self.RNN1(xx)[0]
 
-        mask2d = mask.unsqueeze(1) | mask.unsqueeze(2) | torch.diag(torch.ones(x.shape[1])).bool().unsqueeze(0).to(device)
+        mask2d = mask.unsqueeze(1) | mask.unsqueeze(2) | torch.diag(torch.ones_like(x[1])).bool().unsqueeze(0)
         attn = torch.einsum('bmh,bnh->bmn', [xh, xh])
         attn = attn.masked_fill(mask2d, -INF)
 
         xhat = torch.einsum('bmn,bmh->bnh', [attn.softmax(1), xh])
 
         xc = torch.cat([xhat, xh, xhat - xh, xhat * xh], -1)
+        self.RNN2.flatten_parameters()
         xc = self.RNN2(xc)[0]
 
         v = torch.cat([xc.max(1)[0], xc[:, 0, :]], -1)
@@ -287,7 +289,8 @@ class BiLSTM(nn.Module):
 # %%
 # model = DiSAN()
 model = BiLSTM()
-
+# if torch.cuda.device_count() > 1:
+#     model = DataParallel(model)
 model = model.to(device)
 
 
